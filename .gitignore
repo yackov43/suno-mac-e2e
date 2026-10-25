@@ -1,0 +1,10 @@
+.DS_Store
+._*
+*.dmg
+*.partial
+.env
+.env.*
+*.log
+ngrok.yml
+.venv/
+__pycache__/

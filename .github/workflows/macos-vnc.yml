@@ -1,0 +1,58 @@
+# Free interactive macOS desktop for SunoCoverBot setup tests.
+# Public repository + macos-latest keeps GitHub Actions macOS minutes free.
+# workflow_dispatch only: nothing runs until you click Run workflow.
+
+name: macOS VNC desktop
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Minutes to keep the desktop open (15-300). Cancel the run when you finish."
+        required: false
+        default: "90"
+        type: string
+      download_dmg:
+        description: "Download SunoCoverBotSetup-mac.dmg onto the Desktop"
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: macos-vnc-desktop
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    name: Screen Sharing
+    runs-on: macos-latest
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable macOS Screen Sharing
+        env:
+          VNC_USER_PASSWORD: ${{ secrets.VNC_USER_PASSWORD }}
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: bash scripts/macos-desktop.sh setup
+
+      - name: Download SunoCoverBotSetup-mac.dmg
+        if: ${{ inputs.download_dmg }}
+        continue-on-error: true
+        run: bash scripts/macos-desktop.sh download
+
+      - name: Open tunnels and web shell, then wait
+        timeout-minutes: 360
+        env:
+          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+          VNC_USER_PASSWORD: ${{ secrets.VNC_USER_PASSWORD }}
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+          HOLD_MINUTES: ${{ inputs.minutes }}
+        run: bash scripts/macos-desktop.sh serve

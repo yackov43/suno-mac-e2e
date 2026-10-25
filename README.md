@@ -41,7 +41,7 @@ Open the run and read the **Summary**. The same text is in the job log. The log 
 
 The desktop is the `runner` account that already owns the Aqua session. Google Chrome is installed at `/Applications/Google Chrome.app`. The DMG is on that user's Desktop and at `/Users/Shared/SunoCoverBotSetup-mac.dmg`. `CONNECT.txt` in those same places repeats the addresses.
 
-The setup step does not publish the tunnel when the console is a login window. The job log line `GUI check:` names the console user, whether Finder is running for that user, and the screenshot brightness. A near-black framebuffer fails the job. In the Summary, that same line is how you confirm the desktop was real before you connect. After you open noVNC, the menu bar and Finder should be visible within about a minute.
+The setup step does not publish the tunnel when the console is a login window. The job log line `GUI check:` names the console user, whether Finder is running for that user, and the screenshot brightness. A near-black screenshot fails the job. A black VNC sample is ignored when Screen Sharing offers Apple authentication (RFB types 30 or 33) and the screenshot is already a desktop; that sample is not the console picture, and setup does not type a password into the login window over a desktop that is already up. In the Summary, that same line is how you confirm the desktop was real before you connect. After you open noVNC, the menu bar and Finder should be visible within about a minute.
 
 Install `SunoCoverBot` from the DMG, then install the Chrome extension in the runner's Chrome. If Gatekeeper blocks the app: **System Settings → Privacy & Security → Open Anyway**.
 

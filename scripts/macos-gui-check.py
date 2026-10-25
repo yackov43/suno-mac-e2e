@@ -34,6 +34,18 @@ def picture_kind(mean: int, dark_ppm: int) -> str:
     return "picture"
 
 
+# macOS 26 Screen Sharing offers these alongside legacy VNC (type 2). A Raw
+# sample on that path can be an all-zero buffer while screencapture of the
+# same console is a normal desktop. It is not evidence of a black GUI.
+APPLE_RFB_TYPES = (30, 33)
+
+
+def rfb_sample_kind(pixel_kind: str, security_types: list[int]) -> str:
+    if pixel_kind == "black" and any(item in security_types for item in APPLE_RFB_TYPES):
+        return "skip"
+    return pixel_kind
+
+
 def _luma(r: int, g: int, b: int) -> int:
     return (r * 2126 + g * 7152 + b * 722) // 10000
 
@@ -347,15 +359,19 @@ def sample_vnc(host: str, port: int, password: str) -> str:
                 time.sleep(0.4)
         pixels = _bgra_pixels(b"".join(blobs))
         mean, dark_ppm, distinct = stats_rgb(pixels)
-        kind = picture_kind(mean, dark_ppm)
-        return "%s %s %s %s %s %s note=types:%s" % (
+        pixel_kind = picture_kind(mean, dark_ppm)
+        kind = rfb_sample_kind(pixel_kind, types)
+        note = "types:%s" % type_note
+        if kind == "skip" and pixel_kind == "black":
+            note += ";apple-auth-ignored"
+        return "%s %s %s %s %s %s note=%s" % (
             kind,
             mean,
             dark_ppm,
             distinct,
             width,
             height,
-            type_note,
+            note,
         )
     except Exception as exc:
         text = str(exc).splitlines()[-1][:160] if str(exc) else exc.__class__.__name__
@@ -410,16 +426,22 @@ def write_solid_png(path: str, width: int, height: int, rgb: tuple[int, int, int
         handle.write(blob)
 
 
-def _serve_rfb(conn: socket.socket, rgb: tuple[int, int, int], security: int) -> None:
+def _serve_rfb(
+    conn: socket.socket,
+    rgb: tuple[int, int, int],
+    security: int,
+    types: list[int] | None = None,
+) -> None:
+    offered = types if types is not None else [security]
     conn.sendall(b"RFB 003.008\n")
     version = _recv_exact(conn, 12)
     if version[:3] != b"RFB":
         return
-    conn.sendall(bytes([1, security]))
+    conn.sendall(bytes([len(offered), *offered]))
     chosen = _recv_exact(conn, 1)[0]
-    if chosen != security:
+    if chosen not in offered:
         return
-    if security == 2:
+    if chosen == 2:
         challenge = bytes(range(16))
         conn.sendall(challenge)
         _recv_exact(conn, 16)
@@ -467,6 +489,12 @@ def self_test() -> None:
     response = vnc_des_response(password, challenge)
     if response.hex() != "83dd2b4dbd04367f28578fdd5b142740":
         raise SystemExit("unexpected VNC DES response %s" % response.hex())
+    if rfb_sample_kind("black", [30, 33, 36, 2, 35]) != "skip":
+        raise SystemExit("apple auth black sample was not ignored")
+    if rfb_sample_kind("black", [2]) != "black":
+        raise SystemExit("legacy-only black sample was ignored")
+    if rfb_sample_kind("picture", [30, 33, 2]) != "picture":
+        raise SystemExit("apple auth changed a real picture")
 
     tmp = tempfile.mkdtemp()
     dark = os.path.join(tmp, "dark.png")
@@ -511,6 +539,32 @@ def self_test() -> None:
         line = holder.get("line", "")
         if not line.startswith(expect + " "):
             raise SystemExit("vnc %s expected %s got %s" % (rgb, expect, line))
+
+    # The live macOS 26 server offered 30,33,36,2,35 and a zero framebuffer
+    # while the console screenshot was a desktop. That must be a skip.
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+    holder = {}
+
+    def client_apple() -> None:
+        holder["line"] = sample_vnc("127.0.0.1", port, "secret")
+
+    thread = threading.Thread(target=client_apple)
+    thread.start()
+    conn, _addr = server.accept()
+    conn.settimeout(5)
+    try:
+        _serve_rfb(conn, (0, 0, 0), 2, [30, 33, 36, 2, 35])
+    finally:
+        conn.close()
+        server.close()
+    thread.join(10)
+    apple_line = holder.get("line", "")
+    if not apple_line.startswith("skip ") or "apple-auth-ignored" not in apple_line:
+        raise SystemExit("apple types with a black buffer should skip, got %s" % apple_line)
 
     # Security type 30 alone cannot be sampled and must not look like black.
     server = socket.socket()

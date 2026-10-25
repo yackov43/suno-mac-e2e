@@ -15,6 +15,15 @@
 # macOS 26 that sample is an empty buffer while screencapture is a real
 # desktop, and typing a password into loginwindow then steals the console.
 #
+# kickstart -restart -agent, after loginwindow auto-login defaults were
+# written, started a second loginwindow as root. That process then took
+# /dev/console while Finder and the screenshot stayed on runner's desktop.
+# Screen Sharing follows the console, so publishing would show the login
+# window. Setup does not arm auto-login when the console is already the
+# desktop user, restarts the agent only if port 5900 stays down, and stops
+# a root loginwindow without logging that user out. Publish still requires
+# the console user, Finder, and a non-black screenshot together.
+#
 # The desktop is published with:
 #   - ngrok TCP 5900 for a native VNC client (free ngrok plan; TCP needs a
 #     card saved on the account, and ngrok does not charge that card)
@@ -803,6 +812,35 @@ loginwindow_recovery_allowed() {
   return 0
 }
 
+# 0 when Finder belongs to the desktop user and a root loginwindow is up.
+# The desktop user's own loginwindow is not in this match.
+root_loginwindow_beside_finder() {
+  local desktop="$1"
+  local finder="$2"
+  local windows="$3"
+  if [ "$finder" != "$desktop" ]; then
+    return 1
+  fi
+  case " ${windows} " in
+    *" root "*) return 0 ;;
+  esac
+  return 1
+}
+
+# Same process check, plus a real screenshot. A black screenshot is the
+# login screen itself, so the publish path does not kill it on that basis.
+# 0 when the root loginwindow should be stopped.
+should_drop_root_loginwindow() {
+  local desktop="$1"
+  local finder="$2"
+  local picture="$3"
+  local windows="$4"
+  if [ "$picture" != "picture" ]; then
+    return 1
+  fi
+  root_loginwindow_beside_finder "$desktop" "$finder" "$windows"
+}
+
 downgrade_apple_vnc_sample() {
   if [ "$GUI_VNC" != "black" ]; then
     return 0
@@ -1035,14 +1073,19 @@ fail_gui() {
   detail=$(cat "${ROOT}/gui-check.txt" 2>/dev/null || true)
   log "ERROR: The macOS GUI session is not a logged-in desktop."
   log "ERROR: ${detail}"
-  log "ERROR: Refusing to publish Screen Sharing. A black loginwindow is not a usable desktop."
+  if [ "${GUI_PICTURE:-}" = "picture" ] && [ "${GUI_FINDER:-}" = "$DESKTOP_USER" ] && [ "${GUI_CONSOLE:-}" != "$DESKTOP_USER" ]; then
+    log "ERROR: Finder is ${DESKTOP_USER} and the screenshot is a desktop, but the console is ${GUI_CONSOLE:-unknown}."
+    log "ERROR: Screen Sharing follows the console. Refusing to publish until the console is ${DESKTOP_USER} again."
+  else
+    log "ERROR: Refusing to publish Screen Sharing. A black loginwindow is not a usable desktop."
+  fi
   log "ERROR: Expected console user ${DESKTOP_USER} with Finder running for that user, and a screenshot that is not near-black."
   tail_redacted "${LOG}/gui.log" || true
   if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     cat >>"${GITHUB_STEP_SUMMARY}" <<EOF
 ## Desktop was not ready
 
-Screen Sharing was not published. The console is not a logged-in Aqua desktop, so noVNC would stay black.
+Screen Sharing was not published. The console is not a logged-in Aqua desktop, so noVNC would show the login window.
 
 \`${detail:-"(no GUI check recorded)"}\`
 
@@ -1052,15 +1095,125 @@ EOF
   exit 1
 }
 
+# Pids of loginwindow running as uid 0. The desktop user's loginwindow is
+# left alone: that process owns the Aqua session.
+root_loginwindow_pids() {
+  local found=""
+  found=$(ps -axww -o uid=,pid=,command= 2>/dev/null | awk '
+    $1 == 0 && index($0, "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow") {
+      print $2
+    }
+  ')
+  if [ -n "$found" ]; then
+    printf '%s\n' "$found"
+    return 0
+  fi
+  ps -axww -o uid=,pid=,ucomm= 2>/dev/null | awk '$1 == 0 && $3 == "loginwindow" { print $2 }'
+}
+
+drop_root_loginwindow() {
+  local pids="" pid=""
+  pids=$(root_loginwindow_pids || true)
+  if [ -z "$pids" ]; then
+    return 0
+  fi
+  log "Stopping the root loginwindow without logging ${DESKTOP_USER} out."
+  while read -r pid; do
+    case "$pid" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    log "Stopping root loginwindow pid ${pid}."
+    sudo kill "$pid" >>"${LOG}/gui.log" 2>&1 || true
+  done <<EOF
+$pids
+EOF
+  sleep 1
+  pids=$(root_loginwindow_pids || true)
+  if [ -z "$pids" ]; then
+    return 0
+  fi
+  while read -r pid; do
+    case "$pid" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    log "Root loginwindow pid ${pid} is still running. Sending SIGKILL."
+    sudo kill -9 "$pid" >>"${LOG}/gui.log" 2>&1 || true
+  done <<EOF
+$pids
+EOF
+  sleep 1
+}
+
+# Between kickstart steps the desktop was just verified. Stop a new root
+# loginwindow before it can take /dev/console. Publish still waits for a
+# fresh screenshot.
+drop_extra_root_loginwindow() {
+  local finder="" windows=""
+  finder=$(finder_owner)
+  windows=$(loginwindow_users)
+  if root_loginwindow_beside_finder "$DESKTOP_USER" "$finder" "$windows"; then
+    log "A root loginwindow appeared while Finder is still ${DESKTOP_USER}."
+    drop_root_loginwindow
+  fi
+}
+
+# read_local_gui must have run first. Stops a root loginwindow when the
+# desktop user's Finder and a real screenshot are both still up, then reads
+# the console again. Does not type a password and does not switch sessions.
+settle_visible_desktop() {
+  local windows="" rounds=0 owner=""
+  windows=$(loginwindow_users)
+  owner=$(console_owner)
+  if ! should_drop_root_loginwindow "$DESKTOP_USER" "$GUI_FINDER" "$GUI_PICTURE" "$windows"; then
+    if [ "$owner" = "root" ] && [ "$GUI_PICTURE" = "picture" ] && [ "$GUI_FINDER" = "$DESKTOP_USER" ]; then
+      log "Console is root while ${DESKTOP_USER}'s desktop is still on screen. Stopping a root loginwindow if one is running."
+      drop_root_loginwindow
+      sleep 2
+      read_local_gui || true
+    fi
+    return 0
+  fi
+  while [ "$rounds" -lt 2 ]; do
+    drop_root_loginwindow
+    sleep 2
+    read_local_gui || true
+    windows=$(loginwindow_users)
+    if ! should_drop_root_loginwindow "$DESKTOP_USER" "$GUI_FINDER" "$GUI_PICTURE" "$windows"; then
+      break
+    fi
+    rounds=$((rounds + 1))
+    log "Root loginwindow is still running after stop attempt ${rounds}."
+  done
+  owner=$(console_owner)
+  if [ "$owner" != "$DESKTOP_USER" ]; then
+    log "Console is ${owner:-unknown} after stopping the root loginwindow. ${DESKTOP_USER}'s Finder is still the desktop; not typing a password."
+  else
+    log "Console is ${DESKTOP_USER} after stopping the root loginwindow."
+  fi
+}
+
+note_console() {
+  local label="$1"
+  log "Console ${label}: $(console_owner); loginwindow: $(loginwindow_users)"
+}
+
 ensure_gui_ready() {
   local want_vnc="${1:-}"
   local attempt=1
   local vnc_kind="skip"
+  local saw_desktop=0
   wake_machine
   while [ "$attempt" -le 3 ]; do
     show_finder
     sleep 2
     read_local_gui || true
+    if [ "$GUI_PICTURE" = "picture" ] && [ "$GUI_FINDER" = "$DESKTOP_USER" ]; then
+      saw_desktop=1
+    fi
+    settle_visible_desktop
+    if [ "$GUI_PICTURE" = "picture" ] && [ "$GUI_FINDER" = "$DESKTOP_USER" ]; then
+      saw_desktop=1
+    fi
     vnc_kind="skip"
     GUI_VNC="skip"
     GUI_VNC_NOTE=""
@@ -1074,8 +1227,11 @@ ensure_gui_ready() {
       log "Desktop session is ready for ${DESKTOP_USER}."
       return 0
     fi
-    if ! loginwindow_recovery_allowed "$GUI_PICTURE" "$GUI_FINDER" "$DESKTOP_USER"; then
+    if [ "$saw_desktop" = "1" ] || ! loginwindow_recovery_allowed "$GUI_PICTURE" "$GUI_FINDER" "$DESKTOP_USER"; then
       log "Desktop is not ready (attempt ${attempt} of 3). Screenshot is already a desktop for ${DESKTOP_USER}; not typing into loginwindow."
+      if [ "$GUI_CONSOLE" != "$DESKTOP_USER" ]; then
+        log "Console is ${GUI_CONSOLE:-unknown}. Publish stays blocked until it is ${DESKTOP_USER} again."
+      fi
       attempt=$((attempt + 1))
       continue
     fi
@@ -1084,6 +1240,9 @@ ensure_gui_ready() {
     attempt=$((attempt + 1))
   done
   read_local_gui || true
+  if [ "$GUI_PICTURE" = "picture" ] && [ "$GUI_FINDER" = "$DESKTOP_USER" ]; then
+    settle_visible_desktop
+  fi
   vnc_kind="skip"
   if [ "$want_vnc" = "vnc" ]; then
     sample_vnc_kind || true
@@ -1177,10 +1336,15 @@ enable_screen_sharing() {
     die "Screen Sharing kickstart is missing: ${KICK}"
   fi
   log "Enabling Screen Sharing and the legacy VNC password."
-  log "Not creating a second user, and not restarting the console. The existing Aqua session stays on /dev/console."
+  log "Not creating a second user, and not restarting the console. The agent is restarted only if port 5900 stays down."
+  note_console "before Screen Sharing"
+  # -restart -agent is not on this command. On the runner it started a root
+  # loginwindow, and that process took /dev/console a few seconds later.
   sudo "$KICK" -activate -configure -access -on \
-    -allowAccessFor -allUsers -privs -all -restart -agent \
+    -allowAccessFor -allUsers -privs -all \
     >>"${LOG}/kickstart.log" 2>&1 || log "kickstart activate returned a non-zero status (often still applied)."
+  note_console "after kickstart configure"
+  drop_extra_root_loginwindow
 
   printf '%s\n%s\n' "$VNC_PASSWORD" "$VNC_PASSWORD" | \
     sudo "$KICK" -configure -clientopts -setvnclegacy -vnclegacy yes -setvncpw \
@@ -1196,15 +1360,27 @@ enable_screen_sharing() {
   else
     log "perl is missing, so the legacy password file was not written. kickstart still received the password."
   fi
+  note_console "after VNC password"
+  drop_extra_root_loginwindow
 
-  # Restart the Remote Management agent only. -console restarts loginwindow
-  # and is what left the framebuffer on a black login screen.
-  sudo "$KICK" -restart -agent >>"${LOG}/kickstart.log" 2>&1 || true
-  sudo "$KICK" -activate >>"${LOG}/kickstart.log" 2>&1 || true
-  start_screensharing_service
+  if ! wait_for_port 5900 15; then
+    log "Screen Sharing is not listening yet. Starting the launch daemon without restarting loginwindow."
+    start_screensharing_service
+    note_console "after launchctl bootstrap"
+    drop_extra_root_loginwindow
+  fi
+  if ! port_open 5900; then
+    # One agent restart, and never -console. -console restarts loginwindow
+    # and leaves the framebuffer on a black login screen.
+    log "Screen Sharing is still down. Restarting the Remote Management agent once."
+    sudo "$KICK" -restart -agent >>"${LOG}/kickstart.log" 2>&1 || true
+    sudo "$KICK" -activate >>"${LOG}/kickstart.log" 2>&1 || true
+    note_console "after agent restart"
+    drop_extra_root_loginwindow
+  fi
   redact_file "${LOG}/kickstart.log"
 
-  if ! wait_for_port 5900 30; then
+  if ! wait_for_port 5900 20; then
     log "Screen Sharing is not listening on 127.0.0.1:5900."
     if grep -q "Screen recording might be disabled" "${LOG}/kickstart.log" 2>/dev/null; then
       log "kickstart reported that Screen Recording permission may be missing."
@@ -1214,6 +1390,9 @@ enable_screen_sharing() {
     exit 1
   fi
   log "Screen Sharing is listening on 127.0.0.1:5900."
+  read_local_gui || true
+  settle_visible_desktop
+  note_console "after Screen Sharing"
   screensharing_pids >"${ROOT}/screensharing.pids" || true
 }
 
@@ -1252,13 +1431,22 @@ cmd_setup() {
   log "Console before setup: ${before:-unknown}. Desktop user: ${DESKTOP_USER}."
   log "Leaving the existing Aqua session in place. A second account is not created."
   reset_console_password
-  if [ "$CONSOLE_PASSWORD_SET" = "yes" ]; then
-    arm_autologin "$DESKTOP_USER"
-  fi
   after=$(console_owner)
-  if [ "$before" = "$DESKTOP_USER" ] && [ -n "$after" ] && [ "$after" != "$DESKTOP_USER" ]; then
-    log "Setting the password moved the console from ${before} to ${after}."
-    restore_desktop_session
+  if [ "$before" = "$DESKTOP_USER" ] && [ "$after" = "$DESKTOP_USER" ]; then
+    # sysadminctl -autologin and defaults write com.apple.loginwindow ran
+    # before kickstart on the run where a root loginwindow appeared and
+    # then took /dev/console. The console is already this user, so those
+    # writes are not needed for Screen Sharing.
+    log "Console is already ${DESKTOP_USER}. Not arming auto-login and not writing com.apple.loginwindow."
+  else
+    if [ "$CONSOLE_PASSWORD_SET" = "yes" ]; then
+      arm_autologin "$DESKTOP_USER"
+    fi
+    after=$(console_owner)
+    if [ "$before" = "$DESKTOP_USER" ] && [ -n "$after" ] && [ "$after" != "$DESKTOP_USER" ]; then
+      log "Setting the password moved the console from ${before} to ${after}."
+      restore_desktop_session
+    fi
   fi
   ensure_gui_ready
   enable_screen_sharing
@@ -1757,6 +1945,55 @@ EOF
     :
   else
     die "loginwindow recovery was skipped when Finder was missing"
+  fi
+  if root_loginwindow_beside_finder runner runner "root runner"; then
+    :
+  else
+    die "a root loginwindow beside Finder was ignored"
+  fi
+  if root_loginwindow_beside_finder runner "-" "root"; then
+    die "a root loginwindow was matched when Finder was missing"
+  fi
+  if root_loginwindow_beside_finder runner runner "runner"; then
+    die "the desktop user's loginwindow was matched as an extra root process"
+  fi
+  if should_drop_root_loginwindow runner runner picture "root runner"; then
+    :
+  else
+    die "a root loginwindow over a visible desktop was left running"
+  fi
+  if should_drop_root_loginwindow runner runner picture "root runner "; then
+    :
+  else
+    die "a trailing space hid the root loginwindow"
+  fi
+  if should_drop_root_loginwindow runner runner picture "root"; then
+    :
+  else
+    die "a lone root loginwindow over a visible desktop was left running"
+  fi
+  if should_drop_root_loginwindow runner runner picture "runner root"; then
+    :
+  else
+    die "root listed after the desktop user was left running"
+  fi
+  if should_drop_root_loginwindow runner runner picture "runner"; then
+    die "the desktop user's loginwindow was treated as root"
+  fi
+  if should_drop_root_loginwindow runner runner picture "runner "; then
+    die "the desktop user's loginwindow was treated as root"
+  fi
+  if should_drop_root_loginwindow runner runner black "root runner"; then
+    die "a root loginwindow was stopped while the screenshot was black"
+  fi
+  if should_drop_root_loginwindow runner "-" picture "root"; then
+    die "a root loginwindow was stopped when Finder was not the desktop user"
+  fi
+  if should_drop_root_loginwindow runner runner picture "rooty runner"; then
+    die "a user named rooty was treated as root"
+  fi
+  if gui_verdict runner root runner picture skip; then
+    die "gui_verdict accepted console root while Finder and the screenshot were a desktop"
   fi
   python3 "$GUI_CHECK" self-test
 

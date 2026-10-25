@@ -50,7 +50,9 @@ jobs:
         continue-on-error: true
         run: bash scripts/macos-desktop.sh download
 
-      - name: Open tunnels and web shell, then wait
+      # serve also opens the passwordless desktop view (screencapture over
+      # HTTPS). That page has no VNC password and no username field.
+      - name: Open tunnels, desktop view, and web shell, then wait
         timeout-minutes: 360
         env:
           NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}

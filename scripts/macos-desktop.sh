@@ -34,6 +34,12 @@
 #   - noVNC behind a Cloudflare quick tunnel (browser, no extra account)
 #   - ttyd behind a second quick tunnel (browser shell). Public tmate
 #     servers have been offline since July 2025; tmate is still attempted.
+#   - a passwordless desktop view behind a third quick tunnel. noVNC shows
+#     a username/password dialog when Screen Sharing offers Apple RFB types
+#     30 or 33, and VNC_PASSWORD does not answer it. The view never speaks
+#     RFB. Bash repeats screencapture (the same call the GUI check uses)
+#     and a local HTTP server serves that picture with no basic-auth. The
+#     page is view only.
 #
 # Compatible with the macOS /bin/bash 3.2 that GitHub-hosted runners ship.
 
@@ -55,6 +61,9 @@ NOVNC_URL=""
 NOVNC_VIA=""
 SHELL_URL=""
 SHELL_VIA=""
+VIEW_URL=""
+VIEW_VIA=""
+VIEW_PORT=8090
 VNC_HOST=""
 VNC_PORT=""
 VNC_URL=""
@@ -494,6 +503,103 @@ start_ttyd() {
     fi
     wait_for_port 7681 8
   fi
+}
+
+# One screencapture into image. Tries jpg, then png. -x keeps it
+# non-interactive. Returns 0 when the destination is a non-empty file.
+refresh_desktop_image() {
+  local image="$1"
+  local jpg="${image}.next.jpg"
+  local png="${image}.next.png"
+  local bin=""
+  if command -v screencapture >/dev/null 2>&1; then
+    bin=$(command -v screencapture)
+  elif [ -x /usr/sbin/screencapture ]; then
+    bin=/usr/sbin/screencapture
+  else
+    log "screencapture is not installed"
+    return 1
+  fi
+  rm -f "$jpg" "$png"
+  if "$bin" -x -C -m -t jpg "$jpg" && [ -s "$jpg" ]; then
+    mv -f "$jpg" "$image"
+    return 0
+  fi
+  rm -f "$jpg"
+  if "$bin" -x -C -t jpg "$jpg" && [ -s "$jpg" ]; then
+    mv -f "$jpg" "$image"
+    return 0
+  fi
+  rm -f "$jpg"
+  if "$bin" -x -m -t png "$png" && [ -s "$png" ]; then
+    mv -f "$png" "$image"
+    return 0
+  fi
+  rm -f "$png"
+  if "$bin" -x -t png "$png" && [ -s "$png" ]; then
+    mv -f "$png" "$image"
+    return 0
+  fi
+  rm -f "$png"
+  log "desktop view capture did not write an image"
+  return 1
+}
+
+# Background command: bash macos-desktop.sh capture-loop /path/screen.jpg
+cmd_capture_loop() {
+  local image="${1:-${ROOT}/desktop-view/screen.jpg}"
+  require_macos
+  mkdir -p "$(dirname "$image")"
+  while true; do
+    refresh_desktop_image "$image" || true
+    # Fractional sleep is already used in this script. A short pause keeps
+    # the capture period inside about two seconds after screencapture returns.
+    sleep 0.5
+  done
+}
+
+# Plain HTTP picture of the console. No VNC, no basic-auth, no username.
+# cloudflared publishes it. Capture runs in bash, same as the GUI check.
+# Neither process keeps the VNC or ngrok secrets.
+start_desktop_view() {
+  local script="${SCRIPT_DIR}/macos-desktop-view.py"
+  local image="${ROOT}/desktop-view/screen.jpg"
+  local i=0
+  if [ ! -f "$script" ]; then
+    log "Desktop view script is missing: ${script}"
+    return 1
+  fi
+  if pid_alive "${LOG}/desktop-view.pid" && pid_alive "${LOG}/desktop-capture.pid" && port_open "$VIEW_PORT"; then
+    return 0
+  fi
+  kill_pidfile "${LOG}/desktop-view.pid"
+  kill_pidfile "${LOG}/desktop-capture.pid"
+  mkdir -p "${ROOT}/desktop-view"
+  start_background desktop-capture \
+    env -u VNC_PASSWORD -u VNC_USER_PASSWORD -u NGROK_AUTH_TOKEN \
+    bash "$0" capture-loop "$image"
+  start_background desktop-view \
+    env -u VNC_PASSWORD -u VNC_USER_PASSWORD -u NGROK_AUTH_TOKEN \
+    python3 -u "$script" \
+    --serve-only \
+    --host 127.0.0.1 \
+    --port "$VIEW_PORT" \
+    --image "$image"
+  if ! wait_for_port "$VIEW_PORT" 15; then
+    log "Desktop view server did not bind 127.0.0.1:${VIEW_PORT}."
+    tail_redacted "${LOG}/desktop-view.log"
+    return 1
+  fi
+  while [ "$i" -lt 15 ]; do
+    if [ -s "$image" ]; then
+      log "Desktop view server is listening on 127.0.0.1:${VIEW_PORT} (no password, view only)."
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 1
+  done
+  log "Desktop view is listening on 127.0.0.1:${VIEW_PORT}, but the first capture has not landed yet. The page keeps retrying."
+  return 0
 }
 
 kill_pidfile() {
@@ -1633,6 +1739,20 @@ EOF
   else
     shell_line="### Browser shell"$'\n\n'"ttyd tunnel is not up. See the job log."
   fi
+  if [ -n "$VIEW_URL" ]; then
+    view_line=$(cat <<EOF
+### Desktop view
+
+Open this URL in a browser. Nothing to type: no username, no password, no basic-auth.
+
+- ${VIEW_URL}
+- The page is titled "macOS desktop — view only". It shows the menu bar, Finder, and wallpaper from \`screencapture\`, updating about every second.
+- View only. Mouse and keyboard stay on the browser shell or noVNC.
+EOF
+)
+  else
+    view_line="### Desktop view"$'\n\n'"Desktop view tunnel is not up. See the job log. noVNC and the browser shell are unchanged."
+  fi
   if [ -n "$TMATE_WEB" ] || [ -n "$TMATE_SSH" ]; then
     tmate_line=$(cat <<EOF
 ### tmate
@@ -1660,6 +1780,8 @@ EOF
 This log is public. Anyone who can read it can open the addresses below until the run is cancelled.
 
 ${end_line}
+
+${view_line}
 
 ### Browser desktop
 
@@ -1694,6 +1816,13 @@ print_banner() {
   log "This log is public. Cancel the run when you finish."
   log "Hold: ${HOLD_MINUTES_EFFECTIVE:-?} minutes (ends about ${HOLD_END_TEXT:-unknown})."
   log "GitHub stops the job at 6 hours even if the timer is shorter."
+  log ""
+  log "Desktop view (open this URL in a browser; nothing to type):"
+  log "  ${VIEW_URL:-(not ready)}"
+  log "  No username, no password, and no basic-auth."
+  log "  View only. Mouse and keyboard stay on the browser shell (ttyd) or noVNC."
+  log "  The page is titled \"macOS desktop — view only\" and shows the menu bar, Finder, and wallpaper."
+  log "  The picture updates about every second from screencapture."
   log ""
   log "Browser desktop (open in Chrome, no VNC app):"
   log "  ${link:-"(not ready)"}"
@@ -1744,13 +1873,16 @@ print_banner() {
   elif [ -f "${ROOT}/display-bytes.txt" ]; then
     log "Console capture bytes: $(cat "${ROOT}/display-bytes.txt")"
   fi
-  log "עברית: סיסמת ה-VNC היא הסוד VNC_PASSWORD. שולחן העבודה בדפדפן הוא הקישור למעלה. מבטלים את הריצה בסיום."
+  log "עברית: תצוגת שולחן בלי סיסמה היא קישור Desktop view (צפייה בלבד, בלי שם משתמש). סיסמת ה-VNC היא הסוד VNC_PASSWORD. מבטלים את הריצה בסיום."
   log "============================================================"
   write_summary
   if [ "$NOTICES_SENT" = "yes" ]; then
     return 0
   fi
   NOTICES_SENT="yes"
+  if [ -n "$VIEW_URL" ]; then
+    echo "::notice title=Desktop view::${VIEW_URL}"
+  fi
   if [ -n "$link" ]; then
     echo "::notice title=Browser desktop::${link}"
   fi
@@ -1768,6 +1900,12 @@ write_connect_file() {
   link=$(novnc_link)
   cat >"$tmp" <<EOF
 SunoCoverBot macOS E2E
+
+Desktop view (no password, view only): ${VIEW_URL:-(see the Actions log)}
+Open the Desktop view URL in a browser. Nothing to type.
+No username, no password, and no basic-auth.
+The page is titled "macOS desktop — view only" and updates about every second.
+View only. Mouse and keyboard stay on the browser shell or noVNC.
 
 Browser desktop: ${link:-"(see the Actions log)"}
 VNC password: the VNC_PASSWORD secret (not written in this file)
@@ -1810,6 +1948,20 @@ refresh_tunnels() {
     url=$(start_cloudflared shell 7681 44452 || true)
     if [ -n "$url" ] && [ "$url" != "$SHELL_URL" ]; then
       SHELL_URL="$url"
+      NOTICES_SENT=""
+      print_banner
+    fi
+  fi
+  if ! port_open "$VIEW_PORT" || ! pid_alive "${LOG}/desktop-view.pid" || ! pid_alive "${LOG}/desktop-capture.pid"; then
+    log "Desktop view is down. Starting it again."
+    start_desktop_view || true
+  fi
+  if [ "$VIEW_VIA" = "cloudflare" ] && ! pid_alive "${LOG}/cf-view.pid"; then
+    log "Desktop view tunnel stopped. Opening a new one."
+    url=$(start_cloudflared view "$VIEW_PORT" 44453 || true)
+    url=$(sanitize_public_url "$url")
+    if [ -n "$url" ] && [ "$url" != "$VIEW_URL" ]; then
+      VIEW_URL="$url"
       NOTICES_SENT=""
       print_banner
     fi
@@ -1863,6 +2015,10 @@ cmd_serve() {
   log "Starting the browser shell on 127.0.0.1:7681."
   start_ttyd || true
 
+  log "Starting the passwordless desktop view on 127.0.0.1:${VIEW_PORT}."
+  log "The view repeats screencapture over plain HTTP. It does not use VNC, so there is no username and no password."
+  start_desktop_view || true
+
   log "Opening Cloudflare quick tunnels."
   NOVNC_URL=$(start_cloudflared novnc 6080 44451 || true)
   if [ -n "$NOVNC_URL" ]; then
@@ -1877,6 +2033,18 @@ cmd_serve() {
   else
     log "Cloudflare tunnel for the shell did not return a URL."
     tail_redacted "${LOG}/cf-shell.log"
+  fi
+  if port_open "$VIEW_PORT"; then
+    VIEW_URL=$(start_cloudflared view "$VIEW_PORT" 44453 || true)
+    VIEW_URL=$(sanitize_public_url "$VIEW_URL")
+    if [ -n "$VIEW_URL" ]; then
+      VIEW_VIA="cloudflare"
+    else
+      log "Cloudflare tunnel for the desktop view did not return a URL."
+      tail_redacted "${LOG}/cf-view.log"
+    fi
+  else
+    log "Desktop view server is not listening, so its tunnel was not opened."
   fi
 
   log "Starting ngrok TCP for native VNC."
@@ -1900,6 +2068,16 @@ cmd_serve() {
       SHELL_VIA="ngrok"
     fi
   fi
+  if [ -z "$VIEW_URL" ] && port_open "$VIEW_PORT" && ! pid_alive "${LOG}/ngrok.pid"; then
+    local view_fallback
+    view_fallback=$(start_ngrok_http_fallback "$VIEW_PORT" "desktop view" || true)
+    view_fallback=$(sanitize_public_url "$view_fallback")
+    if [ -n "$view_fallback" ]; then
+      VIEW_URL="$view_fallback"
+      VIEW_VIA="ngrok"
+      log "Desktop view is on an ngrok HTTP address. The free plan shows a warning page before the picture."
+    fi
+  fi
 
   log "Starting tmate (short wait; public servers may be offline)."
   start_tmate
@@ -1907,9 +2085,10 @@ cmd_serve() {
   log "Keeping the display awake for this session."
   start_background caffeinate caffeinate -dimsu
 
-  if [ -z "$NOVNC_URL" ] && [ -z "$VNC_HOST" ] && [ -z "$SHELL_URL" ] && [ -z "$TMATE_SSH" ]; then
+  if [ -z "$NOVNC_URL" ] && [ -z "$VNC_HOST" ] && [ -z "$SHELL_URL" ] && [ -z "$TMATE_SSH" ] && [ -z "$VIEW_URL" ]; then
     log "No tunnel or shell came up, so the runner will not be held."
     tail_redacted "${LOG}/cf-novnc.log"
+    tail_redacted "${LOG}/cf-view.log"
     tail_redacted "${LOG}/ngrok.log"
     exit 1
   fi
@@ -1940,7 +2119,7 @@ cmd_serve() {
       print_banner
       next_banner=$((now_loop + 300))
     else
-      log "Desktop still open. About ${remaining} minutes left. Cancel the run when you finish."
+      log "Desktop still open. About ${remaining} minutes left. Desktop view (no password, view only): ${VIEW_URL:-(not ready)}. Cancel the run when you finish."
     fi
     sleep 60
   done
@@ -2153,6 +2332,69 @@ EOF
     die "gui_verdict accepted console root while Finder and the screenshot were a desktop"
   fi
   python3 "$GUI_CHECK" self-test
+  if ! grep -q 'title=Desktop view::' "${SCRIPT_DIR}/macos-desktop.sh"; then
+    die "Desktop view notice is missing from the serve banner"
+  fi
+  if ! grep -q 'View only. Mouse and keyboard stay on the browser shell' "${SCRIPT_DIR}/macos-desktop.sh"; then
+    die "Desktop view log does not say the page is view only"
+  fi
+  if ! grep -q 'start_cloudflared view' "${SCRIPT_DIR}/macos-desktop.sh"; then
+    die "Desktop view does not use the cloudflared helper"
+  fi
+  if ! python3 "${SCRIPT_DIR}/macos-desktop-view.py" --self-test; then
+    die "desktop view self-test failed"
+  fi
+  view_tmp=$(mktemp -d)
+  fake_bin="${view_tmp}/bin"
+  mkdir -p "$fake_bin"
+  cat >"${fake_bin}/screencapture" <<EOF
+#!/bin/sh
+fmt=""
+prev=""
+dest=""
+for arg in "\$@"; do
+  if [ "\$prev" = "-t" ]; then
+    fmt="\$arg"
+  fi
+  dest="\$arg"
+  prev="\$arg"
+done
+printf '%s\n' "\$*" >>"${view_tmp}/args"
+if [ "\$fmt" != "png" ]; then
+  exit 1
+fi
+python3 -c 'import struct,sys,zlib
+def chunk(tag, data):
+    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+raw = b"\\x00" + bytes((12, 80, 160))
+blob = b"\\x89PNG\\r\\n\\x1a\\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+open(sys.argv[1], "wb").write(blob)' "\$dest"
+EOF
+  chmod +x "${fake_bin}/screencapture"
+  if PATH="${fake_bin}:${PATH}" refresh_desktop_image "${view_tmp}/screen.jpg"; then
+    :
+  else
+    die "refresh_desktop_image did not accept a png screencapture"
+  fi
+  if [ ! -s "${view_tmp}/screen.jpg" ]; then
+    die "refresh_desktop_image left an empty image"
+  fi
+  if ! grep -q -- '-x' "${view_tmp}/args"; then
+    die "screencapture was started without -x"
+  fi
+  if ! grep -q -- '-t jpg' "${view_tmp}/args"; then
+    die "desktop view did not try a jpg screencapture"
+  fi
+  if ! grep -q -- '-t png' "${view_tmp}/args"; then
+    die "desktop view did not fall back to a png screencapture"
+  fi
+  if ! python3 -c 'import sys
+data = open(sys.argv[1], "rb").read()
+if not data.startswith(b"\x89PNG\r\n\x1a\n") or len(data) < 24:
+    raise SystemExit(1)' "${view_tmp}/screen.jpg"; then
+    die "refresh_desktop_image did not publish a png"
+  fi
+  rm -rf "$view_tmp"
 
   if port_open 59991; then
     die "port_open reported a closed port as open"
@@ -2170,6 +2412,7 @@ main() {
     setup) cmd_setup ;;
     download) cmd_download ;;
     serve) cmd_serve ;;
+    capture-loop) cmd_capture_loop "${2:-}" ;;
     --self-test) self_test ;;
     *)
       log "Usage: macos-desktop.sh setup|download|serve|--self-test"

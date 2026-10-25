@@ -1,0 +1,24 @@
+# Runs the desktop script's self-test. No Screen Sharing and no secrets.
+# macos-desktop.sh stays compatible with bash 3.2; this job uses the
+# Ubuntu bash that GitHub hosts, plus python3.
+
+name: desktop script self-test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  self-test:
+    name: bash self-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run macos-desktop.sh --self-test
+        shell: bash
+        run: bash scripts/macos-desktop.sh --self-test

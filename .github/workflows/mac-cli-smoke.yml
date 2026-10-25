@@ -1,0 +1,36 @@
+# Production macOS install, without Screen Sharing.
+# Confirms the script the product ships actually installs the setup app.
+
+name: macOS CLI install smoke
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  mac-cli-smoke:
+    name: mac-cli-smoke
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install and check SunoCoverBotSetup
+        shell: bash
+        run: |
+          curl -fsSL https://46-225-2-111.sslip.io/install-mac.sh | bash
+          app="${HOME}/Applications/SunoCoverBotSetup.app"
+          if [ ! -d "$app" ]; then
+            echo "install-mac.sh did not leave ${app}" >&2
+            exit 1
+          fi
+          codesign -dv "$app"
+          echo "codesign ok: ${app}"
+          # install-mac.sh already opens the app. A GUI process may exit
+          # before this line; the bundle and signature are the required checks.
+          if pgrep -lf SunoCoverBot; then
+            echo "Setup process is running."
+          else
+            echo "No SunoCoverBot process is still running after open."
+          fi

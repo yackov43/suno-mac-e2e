@@ -10,7 +10,10 @@
 # near-black grey (about #121211), while Finder keeps running for runner in
 # the background session. noVNC connects and stays dark. Setup now keeps a
 # single console user, wakes that desktop, and refuses to continue when the
-# screenshot or the VNC framebuffer is still a black loginwindow.
+# screenshot is still a black loginwindow. A black Raw VNC sample is ignored
+# when Screen Sharing offers Apple authentication (RFB types 30 or 33): on
+# macOS 26 that sample is an empty buffer while screencapture is a real
+# desktop, and typing a password into loginwindow then steals the console.
 #
 # The desktop is published with:
 #   - ngrok TCP 5900 for a native VNC client (free ngrok plan; TCP needs a
@@ -759,6 +762,61 @@ gui_verdict() {
   return 0
 }
 
+# macOS Screen Sharing lists Apple authentication (30, 33) next to legacy
+# VNC (2). A black Raw sample on that path is not the console picture.
+apple_rfb_note() {
+  local note="$1"
+  note=${note#note=}
+  note=${note#types:}
+  note=${note%%;*}
+  case ",${note}," in
+    *,30,*|*,33,*) return 0 ;;
+  esac
+  return 1
+}
+
+# 0 when this VNC result must fail the publish gate.
+vnc_blocks_publish() {
+  local picture="$1"
+  local finder="$2"
+  local desktop="$3"
+  local vnc="$4"
+  local note="$5"
+  if [ "$vnc" != "black" ]; then
+    return 1
+  fi
+  if [ "$picture" = "picture" ] && [ "$finder" = "$desktop" ] && apple_rfb_note "$note"; then
+    return 1
+  fi
+  return 0
+}
+
+# Typing into loginwindow is only for a session that is not already a desktop.
+# 0 when recovery may run.
+loginwindow_recovery_allowed() {
+  local picture="$1"
+  local finder="$2"
+  local desktop="$3"
+  if [ "$picture" = "picture" ] && [ "$finder" = "$desktop" ]; then
+    return 1
+  fi
+  return 0
+}
+
+downgrade_apple_vnc_sample() {
+  if [ "$GUI_VNC" != "black" ]; then
+    return 0
+  fi
+  if apple_rfb_note "$GUI_VNC_NOTE"; then
+    log "VNC sample is black under Apple authentication (${GUI_VNC_NOTE}). The screenshot is the gate; ignoring that sample."
+    GUI_VNC="skip"
+    case "$GUI_VNC_NOTE" in
+      *apple-auth-ignored*) ;;
+      *) GUI_VNC_NOTE="${GUI_VNC_NOTE};apple-auth-ignored" ;;
+    esac
+  fi
+}
+
 wake_machine() {
   log "Keeping the display awake."
   sudo mdutil -i off -a >>"${LOG}/setup.log" 2>&1 || true
@@ -880,9 +938,16 @@ restore_desktop_session() {
   fi
   show_finder
   owner=$(console_owner)
-  if [ "$owner" != "$DESKTOP_USER" ] || console_is_locked; then
-    send_login_password
-  fi
+  case "$owner" in
+    ""|root|loginwindow)
+      send_login_password
+      ;;
+    *)
+      if [ "$owner" != "$DESKTOP_USER" ]; then
+        log "Console is ${owner}. Not typing a password over the current session."
+      fi
+      ;;
+  esac
   redact_file "${LOG}/gui.log"
   sleep 2
 }
@@ -1001,12 +1066,18 @@ ensure_gui_ready() {
     GUI_VNC_NOTE=""
     if [ "$want_vnc" = "vnc" ] && gui_verdict "$DESKTOP_USER" "$GUI_CONSOLE" "$GUI_FINDER" "$GUI_PICTURE" skip; then
       sample_vnc_kind
+      downgrade_apple_vnc_sample
       vnc_kind="$GUI_VNC"
     fi
     log_gui_state
     if gui_verdict "$DESKTOP_USER" "$GUI_CONSOLE" "$GUI_FINDER" "$GUI_PICTURE" "$vnc_kind"; then
       log "Desktop session is ready for ${DESKTOP_USER}."
       return 0
+    fi
+    if ! loginwindow_recovery_allowed "$GUI_PICTURE" "$GUI_FINDER" "$DESKTOP_USER"; then
+      log "Desktop is not ready (attempt ${attempt} of 3). Screenshot is already a desktop for ${DESKTOP_USER}; not typing into loginwindow."
+      attempt=$((attempt + 1))
+      continue
     fi
     log "Desktop is not ready (attempt ${attempt} of 3)."
     restore_desktop_session
@@ -1016,6 +1087,7 @@ ensure_gui_ready() {
   vnc_kind="skip"
   if [ "$want_vnc" = "vnc" ]; then
     sample_vnc_kind || true
+    downgrade_apple_vnc_sample
     vnc_kind="$GUI_VNC"
   fi
   log_gui_state
@@ -1649,6 +1721,42 @@ EOF
   fi
   if gui_verdict runner loginwindow runner picture skip; then
     die "gui_verdict accepted loginwindow as the console user"
+  fi
+  if ! apple_rfb_note "types:30,33,36,2,35"; then
+    die "apple RFB types were not recognized"
+  fi
+  if ! apple_rfb_note "types:30"; then
+    die "security type 30 alone was not recognized"
+  fi
+  if apple_rfb_note "types:2"; then
+    die "legacy VNC type 2 was treated as Apple authentication"
+  fi
+  if apple_rfb_note "types:130,2"; then
+    die "type 130 was treated as Apple authentication"
+  fi
+  if vnc_blocks_publish picture runner runner black "types:30,33,36,2,35"; then
+    die "a black Apple-auth VNC sample blocked a picture desktop"
+  fi
+  if vnc_blocks_publish picture runner runner skip "types:30,33"; then
+    die "a skipped VNC sample blocked publish"
+  fi
+  if vnc_blocks_publish picture runner runner black "types:2"; then
+    :
+  else
+    die "a legacy-only black VNC sample was ignored"
+  fi
+  if loginwindow_recovery_allowed picture runner runner; then
+    die "loginwindow recovery ran against a visible Finder desktop"
+  fi
+  if loginwindow_recovery_allowed black runner runner; then
+    :
+  else
+    die "loginwindow recovery was skipped for a black screenshot"
+  fi
+  if loginwindow_recovery_allowed picture "-" runner; then
+    :
+  else
+    die "loginwindow recovery was skipped when Finder was missing"
   fi
   python3 "$GUI_CHECK" self-test
 

@@ -17,14 +17,16 @@
 #
 # A second loginwindow can be running as root while the console is still
 # the desktop user. Stopping that process moved /dev/console to root and
-# the console did not come back, so setup leaves it alone. Screen Sharing
-# publishes the console framebuffer: a root console is the login window
-# even when Finder and screencapture still belong to the desktop user, so
-# that state is not published. If the console is root, setup switches it
-# back with CGSession and does not type a password. Publish requires the
-# console user, Finder, and a non-black screenshot together. Auto-login is
-# not armed when the console is already the desktop user, and the Screen
-# Sharing agent is restarted only if port 5900 stays down.
+# the console did not come back, so setup leaves it alone. On run
+# 40222889194 the short-lived RFB probe was the new event between
+# "console runner" and "loginwindow: root runner"; the console then flipped
+# to root. Setup does not open that probe once Finder and the screenshot
+# are already the desktop, limits Screen Sharing to that user, and turns
+# Fast User Switching off. CGSession was removed after Big Sur, so a missing
+# binary is logged on its own. Screen Sharing follows /dev/console. An
+# Apple-auth RFB sample is an empty buffer, not proof of the desktop, so a
+# root console is not published. Publish requires the console user, Finder,
+# and a non-black screenshot together.
 #
 # The desktop is published with:
 #   - ngrok TCP 5900 for a native VNC client (free ngrok plan; TCP needs a
@@ -865,10 +867,56 @@ console_needs_session_switch() {
 
 # 0 when Screen Sharing may be published.
 # Finder and a real screenshot are required. A root console is not a soft
-# pass: Screen Sharing follows /dev/console, and that framebuffer is the
-# login window when the console user is root.
+# pass: Screen Sharing follows /dev/console. apple_rfb_proves_runner_desktop
+# is false, so a skipped or black Apple RFB sample cannot override that.
 publish_desktop() {
   gui_verdict "$@"
+}
+
+# 0 would mean an Apple-auth RFB sample proves the framebuffer is the
+# desktop user's session while /dev/console is root. It does not. Types 30
+# and 33 return an empty buffer when screencapture is already a desktop.
+apple_rfb_proves_runner_desktop() {
+  return 1
+}
+
+# 0 when a short-lived RFB connection is allowed.
+# Do not probe a visible desktop. Run 40222889194 kept console runner
+# through Screen Sharing, then the probe's GUI check showed
+# loginwindow: root runner, and the console was root before serve.
+should_sample_vnc() {
+  local console="$1"
+  local finder="$2"
+  local desktop="$3"
+  local picture="$4"
+  if [ "$picture" = "picture" ] && [ "$finder" = "$desktop" ]; then
+    return 1
+  fi
+  # console is recorded by the caller. A black screenshot or a missing Finder
+  # may still be probed, including when the console is already root.
+  case "$console" in
+    *) return 0 ;;
+  esac
+}
+
+# Empty string when a session switch can be attempted.
+# "uid" when id -u failed. "cgsession" when the binary is missing.
+switch_block_reason() {
+  local uid="$1"
+  local cgs="$2"
+  if [ -z "$uid" ] && [ -z "$cgs" ]; then
+    printf '%s\n' "uid-and-cgsession"
+    return 0
+  fi
+  if [ -z "$uid" ]; then
+    printf '%s\n' "uid"
+    return 0
+  fi
+  if [ -z "$cgs" ]; then
+    printf '%s\n' "cgsession"
+    return 0
+  fi
+  printf '%s\n' ""
 }
 
 downgrade_apple_vnc_sample() {
@@ -975,16 +1023,35 @@ except Exception as exc:
 }
 
 find_cgsession() {
-  local candidate
+  local candidate="" found=""
+  # User.menu/CGSession was removed in macOS Big Sur. Later images keep no
+  # copy under loginwindow.app. Search the old paths, private frameworks,
+  # PATH, and Spotlight before giving up.
   for candidate in \
     "/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession" \
-    "/System/Library/CoreServices/loginwindow.app/Contents/Resources/CGSession"
+    "/System/Library/CoreServices/loginwindow.app/Contents/Resources/CGSession" \
+    "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/CGSession" \
+    "/System/Library/PrivateFrameworks/login.framework/Versions/A/Resources/CGSession" \
+    "/System/Library/PrivateFrameworks/LoginUIKit.framework/Versions/A/Resources/CGSession" \
+    "/usr/bin/CGSession" \
+    "/usr/local/sbin/CGSession"
   do
     if [ -x "$candidate" ]; then
       printf '%s\n' "$candidate"
       return 0
     fi
   done
+  if command -v CGSession >/dev/null 2>&1; then
+    command -v CGSession
+    return 0
+  fi
+  if command -v mdfind >/dev/null 2>&1; then
+    found=$(mdfind -name CGSession 2>/dev/null | awk '/\/CGSession$/ { print; exit }' || true)
+    if [ -n "$found" ] && [ -x "$found" ]; then
+      printf '%s\n' "$found"
+      return 0
+    fi
+  fi
   return 1
 }
 
@@ -1135,11 +1202,22 @@ switch_console_to_desktop_user() {
   fi
   uid=$(id -u "$DESKTOP_USER" 2>/dev/null || true)
   cgs=$(find_cgsession || true)
-  if [ -z "$uid" ] || [ -z "$cgs" ]; then
-    log "Console is ${before:-unknown}. Not switching: CGSession or the desktop uid is missing."
-    return 0
-  fi
-  log "Console is ${before:-unknown} while ${DESKTOP_USER}'s desktop is on screen. Switching to uid ${uid} with CGSession. Not typing a password. Not stopping loginwindow."
+  log "Session switch check: desktop user ${DESKTOP_USER}, uid ${uid:-missing}, CGSession ${cgs:-missing}."
+  case "$(switch_block_reason "$uid" "$cgs")" in
+    uid)
+      log "Console is ${before:-unknown}. Not switching: uid for ${DESKTOP_USER} is missing (id -u failed)."
+      return 0
+      ;;
+    cgsession)
+      log "Console is ${before:-unknown}. Not switching: CGSession binary is missing. uid for ${DESKTOP_USER} is ${uid}. The binary was removed from macOS after Big Sur and was not found under User.menu, loginwindow.app, login.framework, LoginUIKit, PATH, or mdfind."
+      return 0
+      ;;
+    uid-and-cgsession)
+      log "Console is ${before:-unknown}. Not switching: uid for ${DESKTOP_USER} is missing (id -u failed), and the CGSession binary is missing."
+      return 0
+      ;;
+  esac
+  log "Console is ${before:-unknown} while ${DESKTOP_USER}'s desktop is on screen. Switching to uid ${uid} with ${cgs}. Not typing a password. Not stopping loginwindow."
   if ! sudo launchctl asuser "$uid" "$cgs" -switchToUserID "$uid" >>"${LOG}/gui.log" 2>&1; then
     log "CGSession via launchctl asuser returned non-zero."
   fi
@@ -1208,9 +1286,16 @@ ensure_gui_ready() {
     GUI_VNC="skip"
     GUI_VNC_NOTE=""
     if [ "$want_vnc" = "vnc" ] && publish_desktop "$DESKTOP_USER" "$GUI_CONSOLE" "$GUI_FINDER" "$GUI_PICTURE" skip; then
-      sample_vnc_kind
-      downgrade_apple_vnc_sample
-      vnc_kind="$GUI_VNC"
+      if should_sample_vnc "$GUI_CONSOLE" "$GUI_FINDER" "$DESKTOP_USER" "$GUI_PICTURE"; then
+        sample_vnc_kind
+        downgrade_apple_vnc_sample
+        vnc_kind="$GUI_VNC"
+      else
+        log "Not opening a VNC connection. A probe while ${DESKTOP_USER}'s desktop was up was followed by a root loginwindow and a console flip."
+        GUI_VNC="skip"
+        GUI_VNC_NOTE="probe-skipped"
+        vnc_kind="skip"
+      fi
     fi
     log_gui_state
     if publish_desktop "$DESKTOP_USER" "$GUI_CONSOLE" "$GUI_FINDER" "$GUI_PICTURE" "$vnc_kind"; then
@@ -1234,10 +1319,14 @@ ensure_gui_ready() {
     settle_visible_desktop
   fi
   vnc_kind="skip"
-  if [ "$want_vnc" = "vnc" ]; then
+  if [ "$want_vnc" = "vnc" ] && should_sample_vnc "$GUI_CONSOLE" "$GUI_FINDER" "$DESKTOP_USER" "$GUI_PICTURE"; then
     sample_vnc_kind || true
     downgrade_apple_vnc_sample
     vnc_kind="$GUI_VNC"
+  elif [ "$want_vnc" = "vnc" ]; then
+    log "Not opening a VNC connection. A probe while ${DESKTOP_USER}'s desktop was up was followed by a root loginwindow and a console flip."
+    GUI_VNC="skip"
+    GUI_VNC_NOTE="probe-skipped"
   fi
   log_gui_state
   if publish_desktop "$DESKTOP_USER" "$GUI_CONSOLE" "$GUI_FINDER" "$GUI_PICTURE" "$vnc_kind"; then
@@ -1325,13 +1414,14 @@ enable_screen_sharing() {
   if [ ! -x "$KICK" ]; then
     die "Screen Sharing kickstart is missing: ${KICK}"
   fi
-  log "Enabling Screen Sharing and the legacy VNC password."
+  log "Enabling Screen Sharing for ${DESKTOP_USER} only, with the legacy VNC password."
   log "Not creating a second user, and not restarting the console. The agent is restarted only if port 5900 stays down."
   note_console "before Screen Sharing"
-  # -restart -agent is not on this command. On the runner it started a root
-  # loginwindow, and that process took /dev/console a few seconds later.
+  # -allowAccessFor -allUsers offers a login for every account and was in
+  # effect when a root loginwindow appeared. -restart -agent is omitted:
+  # that restart also started one. -users keeps access on the console user.
   sudo "$KICK" -activate -configure -access -on \
-    -allowAccessFor -allUsers -privs -all \
+    -users "$DESKTOP_USER" -privs -all \
     >>"${LOG}/kickstart.log" 2>&1 || log "kickstart activate returned a non-zero status (often still applied)."
   note_console "after kickstart configure"
 
@@ -1342,6 +1432,10 @@ enable_screen_sharing() {
   sudo "$KICK" -configure -clientopts -setvnclegacy -vnclegacy yes \
     -setvncpw -vncpw "$VNC_PASSWORD" \
     >>"${LOG}/kickstart.log" 2>&1 || true
+
+  # A separate call so an unrecognized flag cannot drop the VNC password.
+  sudo "$KICK" -configure -clientopts -setreqperm -reqperm no \
+    >>"${LOG}/kickstart.log" 2>&1 || log "kickstart did not accept -setreqperm."
 
   if command -v perl >/dev/null 2>&1; then
     vnc_password_hex "$VNC_PASSWORD" | sudo tee /Library/Preferences/com.apple.VNCSettings.txt >/dev/null
@@ -1379,7 +1473,43 @@ enable_screen_sharing() {
   read_local_gui || true
   settle_visible_desktop
   note_console "after Screen Sharing"
+  watch_console_after_screen_sharing
   screensharing_pids >"${ROOT}/screensharing.pids" || true
+}
+
+# Fast User Switching is what lets a second loginwindow take /dev/console
+# while Finder keeps running for the desktop user. Hide it before Screen
+# Sharing starts. This does not log the desktop user out.
+disable_fast_user_switching() {
+  local uid=""
+  log "Disabling Fast User Switching so another loginwindow cannot take the console from ${DESKTOP_USER}."
+  sudo defaults write /Library/Preferences/.GlobalPreferences MultipleSessionEnabled -bool false \
+    >>"${LOG}/gui.log" 2>&1 || log "Could not write MultipleSessionEnabled."
+  uid=$(id -u "$DESKTOP_USER" 2>/dev/null || true)
+  if [ -z "$uid" ]; then
+    log "Could not read uid for ${DESKTOP_USER}; skipped the user-switcher preference."
+    return 0
+  fi
+  sudo launchctl asuser "$uid" defaults -currentHost write com.apple.controlcenter UserSwitcher -int 8 \
+    >>"${LOG}/gui.log" 2>&1 || log "Could not hide the user switcher for ${DESKTOP_USER}."
+}
+
+# The root loginwindow showed up about ten seconds after Screen Sharing
+# began listening, during the RFB probe. Watch without connecting.
+watch_console_after_screen_sharing() {
+  local i=1 owner="" windows=""
+  log "Watching the console for 20 seconds without opening a VNC connection."
+  while [ "$i" -le 4 ]; do
+    sleep 5
+    owner=$(console_owner)
+    windows=$(loginwindow_users)
+    log "Console watch ${i}: ${owner:-unknown}; loginwindow: ${windows}"
+    if [ "$owner" != "$DESKTOP_USER" ]; then
+      read_local_gui || true
+      settle_visible_desktop
+    fi
+    i=$((i + 1))
+  done
 }
 
 reset_console_password() {
@@ -1435,6 +1565,7 @@ cmd_setup() {
     fi
   fi
   ensure_gui_ready
+  disable_fast_user_switching
   enable_screen_sharing
   ensure_gui_ready vnc
   save_session_state
@@ -1990,6 +2121,33 @@ EOF
   fi
   if publish_desktop runner runner "-" picture skip; then
     die "published without Finder"
+  fi
+  if should_sample_vnc runner runner runner picture; then
+    die "opened a VNC probe while Finder and the screenshot were already a desktop"
+  fi
+  if should_sample_vnc root runner runner picture; then
+    die "opened a VNC probe while the console was root and the screenshot was a desktop"
+  fi
+  if should_sample_vnc runner runner runner black; then
+    :
+  else
+    die "skipped a VNC probe when the screenshot was black"
+  fi
+  if should_sample_vnc root "-" runner black; then
+    :
+  else
+    die "skipped a VNC probe when Finder was missing"
+  fi
+  got=$(switch_block_reason "" "")
+  [ "$got" = "uid-and-cgsession" ]
+  got=$(switch_block_reason "" "/tmp/CGSession")
+  [ "$got" = "uid" ]
+  got=$(switch_block_reason "501" "")
+  [ "$got" = "cgsession" ]
+  got=$(switch_block_reason "501" "/tmp/CGSession")
+  [ -z "$got" ]
+  if apple_rfb_proves_runner_desktop; then
+    die "an Apple RFB sample was treated as proof of the runner desktop"
   fi
   if gui_verdict runner root runner picture skip; then
     die "gui_verdict accepted console root while Finder and the screenshot were a desktop"

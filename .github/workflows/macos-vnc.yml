@@ -37,6 +37,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # setup keeps runner's Aqua session on the console and exits if the
+      # screenshot or VNC framebuffer is still a black login window.
       - name: Enable macOS Screen Sharing
         env:
           VNC_USER_PASSWORD: ${{ secrets.VNC_USER_PASSWORD }}

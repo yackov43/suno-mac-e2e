@@ -2,7 +2,17 @@
 # Interactive macOS desktop for SunoCoverBot E2E tests on GitHub Actions.
 #
 # Screen Sharing setup follows the debug-on-mac / fastmac-VNCgui pattern
-# (ARD kickstart + legacy VNC password). The desktop is published with:
+# (ARD kickstart + legacy VNC password), with one deliberate change: do not
+# create a second macOS user. On the GitHub-hosted runner the job already
+# runs inside runner's Aqua session (Finder is up). Creating vncuser and
+# restarting the console fast-user-switches /dev/console onto vncuser's
+# loginwindow. Screen Sharing then publishes that framebuffer, which is a
+# near-black grey (about #121211), while Finder keeps running for runner in
+# the background session. noVNC connects and stays dark. Setup now keeps a
+# single console user, wakes that desktop, and refuses to continue when the
+# screenshot or the VNC framebuffer is still a black loginwindow.
+#
+# The desktop is published with:
 #   - ngrok TCP 5900 for a native VNC client (free ngrok plan; TCP needs a
 #     card saved on the account, and ngrok does not charge that card)
 #   - noVNC behind a Cloudflare quick tunnel (browser, no extra account)
@@ -22,6 +32,8 @@ LOG="${ROOT}/log"
 BIN="${ROOT}/bin"
 SRC="${ROOT}/src"
 KICK="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
+SCRIPT_DIR=$(cd "$(dirname -- "$0")" && pwd)
+GUI_CHECK="${SCRIPT_DIR}/macos-gui-check.py"
 
 NOVNC_URL=""
 NOVNC_VIA=""
@@ -38,6 +50,18 @@ TMATE_STATUS=""
 TMATE_SSH_NOTE=""
 CONSOLE_PASSWORD_SET="no"
 CONSOLE_USER=""
+DESKTOP_USER=""
+GUI_SUMMARY=""
+GUI_PICTURE=""
+GUI_MEAN=0
+GUI_DARK=1000
+GUI_DISTINCT=0
+GUI_WIDTH=0
+GUI_HEIGHT=0
+GUI_VNC="skip"
+GUI_VNC_NOTE=""
+GUI_CONSOLE=""
+GUI_FINDER=""
 
 log() {
   printf '%s\n' "$*" >&2
@@ -64,7 +88,7 @@ require_vnc_secrets() {
     log "Missing Actions secrets."
     log "Add both repository secrets, then run this workflow again:"
     log "  VNC_PASSWORD         legacy VNC password, 8 characters or fewer"
-    log "  VNC_USER_PASSWORD    macOS password for users vncuser and ${CONSOLE_USER:-runner}"
+    log "  VNC_USER_PASSWORD    macOS password for the console user (${CONSOLE_USER:-runner})"
     log "Optional, for a native VNC client through ngrok TCP:"
     log "  NGROK_AUTH_TOKEN     https://dashboard.ngrok.com/get-started/your-authtoken"
     exit 1
@@ -683,18 +707,405 @@ cmd_download() {
   fi
 }
 
+console_owner() {
+  stat -f '%Su' /dev/console 2>/dev/null || true
+}
+
+finder_owner() {
+  local user=""
+  if [ -n "${DESKTOP_USER:-}" ] && pgrep -u "$DESKTOP_USER" -x Finder >/dev/null 2>&1; then
+    printf '%s\n' "$DESKTOP_USER"
+    return 0
+  fi
+  user=$(ps -axo user=,ucomm= 2>/dev/null | awk '$2 == "Finder" { print $1; exit }')
+  if [ -z "$user" ]; then
+    printf '%s\n' "-"
+  else
+    printf '%s\n' "$user"
+  fi
+}
+
+loginwindow_users() {
+  ps -axo user=,ucomm= 2>/dev/null | awk '$2 == "loginwindow" { print $1 }' | sort | uniq | tr '\n' ' ' || true
+}
+
+console_is_locked() {
+  ioreg -n Root -d1 2>/dev/null | grep -q 'IOConsoleLocked" = Yes'
+}
+
+# Pure decision used by the macOS setup and by --self-test.
+# picture is "picture", "black", or "error". vnc is "picture", "black", or "skip".
+gui_verdict() {
+  local desktop="$1"
+  local console="$2"
+  local finder="$3"
+  local picture="$4"
+  local vnc="${5:-skip}"
+  if [ -z "$desktop" ] || [ "$console" != "$desktop" ]; then
+    return 1
+  fi
+  case "$console" in
+    root|loginwindow) return 1 ;;
+  esac
+  if [ "$finder" != "$desktop" ]; then
+    return 1
+  fi
+  if [ "$picture" != "picture" ]; then
+    return 1
+  fi
+  if [ "$vnc" = "black" ]; then
+    return 1
+  fi
+  return 0
+}
+
+wake_machine() {
+  log "Keeping the display awake."
+  sudo mdutil -i off -a >>"${LOG}/setup.log" 2>&1 || true
+  sudo pmset -a displaysleep 0 sleep 0 disksleep 0 >>"${LOG}/setup.log" 2>&1 || true
+  if ! pid_alive "${LOG}/caffeinate.pid"; then
+    start_background caffeinate caffeinate -dimsu
+  fi
+  # -u marks the user active and wakes a display that has gone dark.
+  caffeinate -u -t 5 >/dev/null 2>&1 || true
+}
+
+write_kcpassword() {
+  printf '%s' "$VNC_USER_PASSWORD" | sudo perl -e '
+    use strict;
+    use warnings;
+    my @key = (0x7D, 0x89, 0x52, 0x23, 0xD2, 0xBC, 0xDD, 0xEA, 0xA3, 0xB9, 0x1F);
+    my $pw = do { local $/; <STDIN> };
+    $pw =~ s/[\r\n]+\z//;
+    my @b = unpack("C*", $pw);
+    my $k = scalar @key;
+    if (@b % $k) {
+      push @b, (0) x ($k - (@b % $k));
+    }
+    for (my $n = 0; $n < @b; $n += $k) {
+      for my $i (0 .. $k - 1) {
+        $b[$n + $i] ^= $key[$i];
+      }
+    }
+    open my $out, ">", "/etc/kcpassword" or die $!;
+    binmode $out;
+    print $out pack("C*", @b);
+    close $out;
+  ' >>"${LOG}/gui.log" 2>&1
+  sudo chmod 600 /etc/kcpassword >>"${LOG}/gui.log" 2>&1 || return 1
+  sudo chown root:wheel /etc/kcpassword >>"${LOG}/gui.log" 2>&1 || \
+    sudo chown root /etc/kcpassword >>"${LOG}/gui.log" 2>&1 || true
+}
+
+arm_autologin() {
+  local user="$1"
+  log "Arming auto-login for ${user} and turning the screen lock off."
+  if sudo sysadminctl -autologin set -userName "$user" -password "$VNC_USER_PASSWORD" >>"${LOG}/gui.log" 2>&1; then
+    log "Auto-login is set for ${user}."
+  else
+    log "sysadminctl did not accept auto-login. Writing /etc/kcpassword directly."
+    write_kcpassword || log "Could not write /etc/kcpassword."
+  fi
+  sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser "$user" >>"${LOG}/gui.log" 2>&1 || true
+  sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUserScreenLocked -bool false >>"${LOG}/gui.log" 2>&1 || true
+  sudo defaults delete /Library/Preferences/com.apple.loginwindow lastLoginPanic >>"${LOG}/gui.log" 2>&1 || true
+  sudo sysadminctl -screenLock off -password "$VNC_USER_PASSWORD" >>"${LOG}/gui.log" 2>&1 || \
+    log "Could not turn the screen lock off."
+  redact_file "${LOG}/gui.log"
+}
+
+show_finder() {
+  local uid=""
+  uid=$(id -u "$DESKTOP_USER" 2>/dev/null || true)
+  if [ -n "$uid" ]; then
+    sudo launchctl asuser "$uid" open -a Finder >>"${LOG}/gui.log" 2>&1 || true
+  fi
+  open -a Finder >>"${LOG}/gui.log" 2>&1 || true
+  python3 -c 'import subprocess
+try:
+    subprocess.run(["osascript", "-e", "tell application \"Finder\" to activate"], timeout=15, check=False)
+except Exception:
+    pass' >>"${LOG}/gui.log" 2>&1 || true
+  if [ ! -f "${ROOT}/finder-window" ]; then
+    if python3 -c 'import subprocess, sys
+try:
+    completed = subprocess.run(["osascript", "-e", "tell application \"Finder\" to make new Finder window"], timeout=15, check=False)
+except Exception:
+    sys.exit(1)
+sys.exit(completed.returncode)' >>"${LOG}/gui.log" 2>&1; then
+      : >"${ROOT}/finder-window"
+    fi
+  fi
+}
+
+send_login_password() {
+  log "Console is not ${DESKTOP_USER}. Sending that user's password to the login window."
+  VNC_USER_PASSWORD="$VNC_USER_PASSWORD" python3 -c 'import subprocess, sys
+script = "tell application \"System Events\" to keystroke (system attribute \"VNC_USER_PASSWORD\") & return"
+try:
+    subprocess.run(["osascript", "-e", script], timeout=20, check=False)
+except Exception as exc:
+    sys.stderr.write("%s\n" % exc)' >>"${LOG}/gui.log" 2>&1 || true
+}
+
+find_cgsession() {
+  local candidate
+  for candidate in \
+    "/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession" \
+    "/System/Library/CoreServices/loginwindow.app/Contents/Resources/CGSession"
+  do
+    if [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+restore_desktop_session() {
+  local uid="" cgs="" pid="" owner=""
+  uid=$(id -u "$DESKTOP_USER" 2>/dev/null || true)
+  log "Bringing ${DESKTOP_USER}'s Aqua session back to the console."
+  sudo sysadminctl -screenLock off -password "$VNC_USER_PASSWORD" >>"${LOG}/gui.log" 2>&1 || true
+  sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUserScreenLocked -bool false >>"${LOG}/gui.log" 2>&1 || true
+  cgs=$(find_cgsession || true)
+  if [ -n "$cgs" ] && [ -n "$uid" ]; then
+    log "Switching the console to uid ${uid} with CGSession."
+    pid=$(pgrep -u "$DESKTOP_USER" -x loginwindow | head -n 1 || true)
+    if [ -n "$pid" ]; then
+      sudo launchctl bsexec "$pid" "$cgs" -switchToUserID "$uid" >>"${LOG}/gui.log" 2>&1 || true
+    else
+      sudo launchctl asuser "$uid" "$cgs" -switchToUserID "$uid" >>"${LOG}/gui.log" 2>&1 || true
+    fi
+  fi
+  show_finder
+  owner=$(console_owner)
+  if [ "$owner" != "$DESKTOP_USER" ] || console_is_locked; then
+    send_login_password
+  fi
+  redact_file "${LOG}/gui.log"
+  sleep 2
+}
+
+classify_png() {
+  local line="" kind=""
+  GUI_PICTURE="error"
+  GUI_MEAN=0
+  GUI_DARK=1000
+  GUI_DISTINCT=0
+  GUI_WIDTH=0
+  GUI_HEIGHT=0
+  if [ ! -s "${ROOT}/console.png" ]; then
+    return 1
+  fi
+  if [ ! -f "$GUI_CHECK" ]; then
+    log "Missing ${GUI_CHECK}."
+    return 1
+  fi
+  line=$(python3 "$GUI_CHECK" png-stats "${ROOT}/console.png" 2>>"${LOG}/gui.log" || true)
+  read -r kind GUI_MEAN GUI_DARK GUI_DISTINCT GUI_WIDTH GUI_HEIGHT <<EOF
+$line
+EOF
+  case "$kind" in
+    picture|black) GUI_PICTURE="$kind" ;;
+    *) GUI_PICTURE="error" ;;
+  esac
+}
+
+capture_console() {
+  rm -f "${ROOT}/console.png"
+  screencapture -x "${ROOT}/console.png" >>"${LOG}/gui.log" 2>&1 || return 1
+  [ -s "${ROOT}/console.png" ]
+}
+
+sample_vnc_kind() {
+  local line="" kind=""
+  GUI_VNC="skip"
+  GUI_VNC_NOTE=""
+  if ! port_open 5900; then
+    GUI_VNC_NOTE="port-5900-closed"
+    return 0
+  fi
+  if [ ! -f "$GUI_CHECK" ]; then
+    GUI_VNC_NOTE="no-gui-check"
+    return 0
+  fi
+  line=$(VNC_PASSWORD="$VNC_PASSWORD" python3 "$GUI_CHECK" vnc-sample 5900 2>>"${LOG}/gui.log" || true)
+  read -r kind _mean _dark _distinct _width _height note <<EOF
+$line
+EOF
+  case "$kind" in
+    picture|black|skip) GUI_VNC="$kind" ;;
+    *) GUI_VNC="skip" ;;
+  esac
+  GUI_VNC_NOTE=${note#note=}
+  log "VNC framebuffer sample: ${line}"
+}
+
+log_gui_state() {
+  local bytes=0
+  if [ -f "${ROOT}/console.png" ]; then
+    bytes=$(stat -f%z "${ROOT}/console.png" 2>/dev/null || wc -c <"${ROOT}/console.png" | tr -d ' ')
+  fi
+  printf '%s\n' "$bytes" >"${ROOT}/display-bytes.txt"
+  GUI_SUMMARY="console ${GUI_CONSOLE:-unknown}, Finder ${GUI_FINDER:-unknown}, screenshot ${GUI_WIDTH:-0}x${GUI_HEIGHT:-0} ${GUI_PICTURE:-error} mean ${GUI_MEAN:-0}/255 dark ${GUI_DARK:-0}/1000 distinct ${GUI_DISTINCT:-0}, VNC ${GUI_VNC:-skip}${GUI_VNC_NOTE:+ ${GUI_VNC_NOTE}}"
+  printf '%s\n' "$GUI_SUMMARY" >"${ROOT}/gui-check.txt"
+  log "GUI check: ${GUI_SUMMARY} (${bytes} bytes). loginwindow: $(loginwindow_users)"
+}
+
+read_local_gui() {
+  GUI_CONSOLE=$(console_owner)
+  GUI_FINDER=$(finder_owner)
+  if ! capture_console; then
+    GUI_PICTURE="error"
+    log "screencapture did not write a console image."
+    return 1
+  fi
+  classify_png || true
+  return 0
+}
+
+fail_gui() {
+  local detail=""
+  detail=$(cat "${ROOT}/gui-check.txt" 2>/dev/null || true)
+  log "ERROR: The macOS GUI session is not a logged-in desktop."
+  log "ERROR: ${detail}"
+  log "ERROR: Refusing to publish Screen Sharing. A black loginwindow is not a usable desktop."
+  log "ERROR: Expected console user ${DESKTOP_USER} with Finder running for that user, and a screenshot that is not near-black."
+  tail_redacted "${LOG}/gui.log" || true
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    cat >>"${GITHUB_STEP_SUMMARY}" <<EOF
+## Desktop was not ready
+
+Screen Sharing was not published. The console is not a logged-in Aqua desktop, so noVNC would stay black.
+
+\`${detail:-"(no GUI check recorded)"}\`
+
+Expected console user \`${DESKTOP_USER}\` with Finder running as that user, and a screenshot brighter than the dark grey login window. See the \`GUI check:\` lines in the job log.
+EOF
+  fi
+  exit 1
+}
+
+ensure_gui_ready() {
+  local want_vnc="${1:-}"
+  local attempt=1
+  local vnc_kind="skip"
+  wake_machine
+  while [ "$attempt" -le 3 ]; do
+    show_finder
+    sleep 2
+    read_local_gui || true
+    vnc_kind="skip"
+    GUI_VNC="skip"
+    GUI_VNC_NOTE=""
+    if [ "$want_vnc" = "vnc" ] && gui_verdict "$DESKTOP_USER" "$GUI_CONSOLE" "$GUI_FINDER" "$GUI_PICTURE" skip; then
+      sample_vnc_kind
+      vnc_kind="$GUI_VNC"
+    fi
+    log_gui_state
+    if gui_verdict "$DESKTOP_USER" "$GUI_CONSOLE" "$GUI_FINDER" "$GUI_PICTURE" "$vnc_kind"; then
+      log "Desktop session is ready for ${DESKTOP_USER}."
+      return 0
+    fi
+    log "Desktop is not ready (attempt ${attempt} of 3)."
+    restore_desktop_session
+    attempt=$((attempt + 1))
+  done
+  read_local_gui || true
+  vnc_kind="skip"
+  if [ "$want_vnc" = "vnc" ]; then
+    sample_vnc_kind || true
+    vnc_kind="$GUI_VNC"
+  fi
+  log_gui_state
+  if gui_verdict "$DESKTOP_USER" "$GUI_CONSOLE" "$GUI_FINDER" "$GUI_PICTURE" "$vnc_kind"; then
+    log "Desktop session is ready for ${DESKTOP_USER}."
+    return 0
+  fi
+  fail_gui
+}
+
+save_session_state() {
+  printf '%s\n' "$DESKTOP_USER" >"${ROOT}/desktop-user"
+  printf '%s\n' "$CONSOLE_PASSWORD_SET" >"${ROOT}/console-password-set"
+  printf '%s\n' "${CONSOLE_USER:-$DESKTOP_USER}" >"${ROOT}/console-user"
+}
+
+load_session_state() {
+  if [ -f "${ROOT}/desktop-user" ]; then
+    DESKTOP_USER=$(cat "${ROOT}/desktop-user")
+  fi
+  if [ -z "${DESKTOP_USER:-}" ]; then
+    DESKTOP_USER=$(id -un)
+  fi
+  if [ -f "${ROOT}/console-password-set" ]; then
+    CONSOLE_PASSWORD_SET=$(cat "${ROOT}/console-password-set")
+  fi
+  if [ -z "${CONSOLE_USER:-}" ]; then
+    CONSOLE_USER=$(id -un)
+  fi
+}
+
+screensharing_pids() {
+  {
+    pgrep -x screensharingd || true
+    pgrep -x AppleVNCServer || true
+    pgrep -x ARDAgent || true
+  } | sort | tr '\n' ' '
+  printf '\n'
+}
+
+start_screensharing_service() {
+  sudo launchctl enable system/com.apple.screensharing >>"${LOG}/kickstart.log" 2>&1 || true
+  sudo launchctl bootstrap system /System/Library/LaunchDaemons/com.apple.screensharing.plist \
+    >>"${LOG}/kickstart.log" 2>&1 || \
+    sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist \
+    >>"${LOG}/kickstart.log" 2>&1 || true
+}
+
+force_restart_novnc() {
+  log "Restarting the noVNC proxy so it opens a fresh connection to Screen Sharing."
+  kill_pidfile "${LOG}/novnc.pid"
+  start_novnc_proxy || true
+  if ! wait_for_port 6080 10; then
+    log "noVNC proxy did not bind 6080 after the restart."
+    tail_redacted "${LOG}/novnc.log"
+  fi
+}
+
+# Screen Sharing restarts drop websockify's TCP session. noVNC then sits on
+# "Connecting…" until the proxy is started again. Watch the listener and the
+# screensharing pids and recycle the proxy when either changes.
+guard_novnc() {
+  local sig="" old=""
+  sig=$(screensharing_pids)
+  old=$(cat "${ROOT}/screensharing.pids" 2>/dev/null || true)
+  if [ -n "$old" ] && [ "$sig" != "$old" ]; then
+    log "Screen Sharing process changed. Recycling noVNC."
+    force_restart_novnc
+  fi
+  printf '%s\n' "$sig" >"${ROOT}/screensharing.pids"
+  if ! port_open 5900; then
+    log "Screen Sharing is not listening. Starting it again without touching the console session."
+    start_screensharing_service
+    if wait_for_port 5900 15; then
+      force_restart_novnc
+    else
+      log "Screen Sharing did not come back."
+    fi
+  elif ! port_open 6080 || ! pid_alive "${LOG}/novnc.pid"; then
+    log "noVNC proxy is down. Starting it again."
+    start_novnc_proxy || true
+  fi
+}
+
 enable_screen_sharing() {
   if [ ! -x "$KICK" ]; then
     die "Screen Sharing kickstart is missing: ${KICK}"
   fi
-  log "Turning Spotlight indexing off and keeping the display awake."
-  sudo mdutil -i off -a >>"${LOG}/setup.log" 2>&1 || true
-  sudo pmset -a displaysleep 0 sleep 0 disksleep 0 >>"${LOG}/setup.log" 2>&1 || true
-
-  create_vnc_user
-  reset_console_password
-
   log "Enabling Screen Sharing and the legacy VNC password."
+  log "Not creating a second user, and not restarting the console. The existing Aqua session stays on /dev/console."
   sudo "$KICK" -activate -configure -access -on \
     -allowAccessFor -allUsers -privs -all -restart -agent \
     >>"${LOG}/kickstart.log" 2>&1 || log "kickstart activate returned a non-zero status (often still applied)."
@@ -714,75 +1125,38 @@ enable_screen_sharing() {
     log "perl is missing, so the legacy password file was not written. kickstart still received the password."
   fi
 
-  sudo "$KICK" -restart -agent -console >>"${LOG}/kickstart.log" 2>&1 || true
+  # Restart the Remote Management agent only. -console restarts loginwindow
+  # and is what left the framebuffer on a black login screen.
+  sudo "$KICK" -restart -agent >>"${LOG}/kickstart.log" 2>&1 || true
   sudo "$KICK" -activate >>"${LOG}/kickstart.log" 2>&1 || true
-  sudo launchctl enable system/com.apple.screensharing >>"${LOG}/kickstart.log" 2>&1 || true
-  sudo launchctl bootstrap system /System/Library/LaunchDaemons/com.apple.screensharing.plist \
-    >>"${LOG}/kickstart.log" 2>&1 || \
-    sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist \
-    >>"${LOG}/kickstart.log" 2>&1 || true
+  start_screensharing_service
+  redact_file "${LOG}/kickstart.log"
 
   if ! wait_for_port 5900 30; then
     log "Screen Sharing is not listening on 127.0.0.1:5900."
+    if grep -q "Screen recording might be disabled" "${LOG}/kickstart.log" 2>/dev/null; then
+      log "kickstart reported that Screen Recording permission may be missing."
+    fi
     tail_redacted "${LOG}/kickstart.log"
     tail_redacted "${LOG}/user.log"
     exit 1
   fi
   log "Screen Sharing is listening on 127.0.0.1:5900."
-
-  local bytes=0
-  if screencapture -x "${ROOT}/console.png" 2>>"${LOG}/setup.log"; then
-    bytes=$(stat -f%z "${ROOT}/console.png" 2>/dev/null || printf '%s' 0)
-  fi
-  printf '%s\n' "$bytes" >"${ROOT}/display-bytes.txt"
-  log "Console capture size: ${bytes} bytes."
-}
-
-create_vnc_user() {
-  sudo mkdir -p /Users/Shared
-  sudo chmod 755 /Users/Shared
-  if id vncuser >/dev/null 2>&1; then
-    sudo dscl . -passwd /Users/vncuser "$VNC_USER_PASSWORD" >>"${LOG}/user.log" 2>&1 || true
-    log "User vncuser already exists. Password update attempted."
-  elif sudo sysadminctl -addUser vncuser \
-      -fullName "VNC User" \
-      -password "$VNC_USER_PASSWORD" \
-      -admin -shell /bin/zsh -home /Users/vncuser \
-      >>"${LOG}/user.log" 2>&1; then
-    log "Created admin user vncuser."
-  else
-    log "sysadminctl could not create vncuser. Trying dscl."
-    local uid=1001
-    while [ "$uid" -lt 2000 ] && sudo dscl . -list /Users UniqueID 2>/dev/null | awk '{print $2}' | grep -qx "$uid"; do
-      uid=$((uid + 1))
-    done
-    sudo dscl . -create /Users/vncuser >>"${LOG}/user.log" 2>&1 || true
-    sudo dscl . -create /Users/vncuser UserShell /bin/zsh >>"${LOG}/user.log" 2>&1 || true
-    sudo dscl . -create /Users/vncuser RealName "VNC User" >>"${LOG}/user.log" 2>&1 || true
-    sudo dscl . -create /Users/vncuser UniqueID "$uid" >>"${LOG}/user.log" 2>&1 || true
-    sudo dscl . -create /Users/vncuser PrimaryGroupID 80 >>"${LOG}/user.log" 2>&1 || true
-    sudo dscl . -create /Users/vncuser NFSHomeDirectory /Users/vncuser >>"${LOG}/user.log" 2>&1 || true
-    sudo dscl . -passwd /Users/vncuser "$VNC_USER_PASSWORD" >>"${LOG}/user.log" 2>&1 || true
-    sudo dscl . -passwd /Users/vncuser "$VNC_USER_PASSWORD" >>"${LOG}/user.log" 2>&1 || true
-    sudo dseditgroup -o edit -a vncuser -t user admin >>"${LOG}/user.log" 2>&1 || true
-  fi
-  sudo createhomedir -c -u vncuser >/dev/null 2>&1 || true
-  sudo mkdir -p /Users/vncuser/Desktop
-  sudo chown -R vncuser:staff /Users/vncuser >>"${LOG}/user.log" 2>&1 || \
-    sudo chown -R vncuser /Users/vncuser >>"${LOG}/user.log" 2>&1 || true
-  redact_file "${LOG}/user.log"
+  screensharing_pids >"${ROOT}/screensharing.pids" || true
 }
 
 reset_console_password() {
-  local user
-  user=$(id -un)
+  local user="$DESKTOP_USER"
   if sudo sysadminctl -resetPasswordFor "$user" -newPassword "$VNC_USER_PASSWORD" >>"${LOG}/user.log" 2>&1; then
     CONSOLE_PASSWORD_SET="yes"
+    log "Set the macOS password for ${user}."
   elif printf '%s\n' "$VNC_USER_PASSWORD" | sudo dscl . -passwd "/Users/${user}" >>"${LOG}/user.log" 2>&1; then
     CONSOLE_PASSWORD_SET="yes"
+    log "Set the macOS password for ${user} with dscl."
   else
     CONSOLE_PASSWORD_SET="no"
-    log "Could not set the console user password. Legacy VNC still uses VNC_PASSWORD. Apple Screen Sharing can use vncuser."
+    log "Could not set the macOS password for ${user}. Legacy VNC still uses VNC_PASSWORD."
+    log "If a client asks for a macOS account, VNC_USER_PASSWORD may be rejected."
   fi
   redact_file "${LOG}/user.log"
 }
@@ -792,15 +1166,34 @@ cmd_setup() {
   need_dir
   note_start
   CONSOLE_USER=$(id -un)
+  DESKTOP_USER="$CONSOLE_USER"
   require_vnc_secrets
-  local vnc_len
+  local vnc_len before="" after=""
   vnc_len=$(printf '%s' "$VNC_PASSWORD" | wc -c | tr -d ' ')
   if [ "$vnc_len" -gt 8 ]; then
     log "VNC_PASSWORD is ${vnc_len} characters. Legacy VNC uses the first 8."
   fi
+  sudo mkdir -p /Users/Shared
+  sudo chmod 755 /Users/Shared
+  wake_machine
+  before=$(console_owner)
+  log "Console before setup: ${before:-unknown}. Desktop user: ${DESKTOP_USER}."
+  log "Leaving the existing Aqua session in place. A second account is not created."
+  reset_console_password
+  if [ "$CONSOLE_PASSWORD_SET" = "yes" ]; then
+    arm_autologin "$DESKTOP_USER"
+  fi
+  after=$(console_owner)
+  if [ "$before" = "$DESKTOP_USER" ] && [ -n "$after" ] && [ "$after" != "$DESKTOP_USER" ]; then
+    log "Setting the password moved the console from ${before} to ${after}."
+    restore_desktop_session
+  fi
+  ensure_gui_ready
   enable_screen_sharing
+  ensure_gui_ready vnc
+  save_session_state
   mkdir -p "${HOME}/Desktop"
-  log "Screen Sharing is ready for user ${CONSOLE_USER} and vncuser."
+  log "Screen Sharing is ready. Logged-in desktop user: ${DESKTOP_USER}."
 }
 
 novnc_link() {
@@ -835,16 +1228,18 @@ EOF
 )
   fi
   if [ "$CONSOLE_PASSWORD_SET" = "yes" ]; then
-    account_line="- If the client asks for a macOS account, use \`${CONSOLE_USER}\` or \`vncuser\`. Password: the \`VNC_USER_PASSWORD\` secret."
+    account_line="- The desktop is already logged in as \`${DESKTOP_USER:-$CONSOLE_USER}\`. If a client asks for a macOS account, use that name. Password: the \`VNC_USER_PASSWORD\` secret."
   else
-    account_line="- If the client asks for a macOS account, use \`vncuser\`. Password: the \`VNC_USER_PASSWORD\` secret. The console user password was left unchanged."
+    account_line="- The desktop is already logged in as \`${DESKTOP_USER:-$CONSOLE_USER}\`. Legacy VNC uses \`VNC_PASSWORD\`. The macOS account password was left unchanged, so a username prompt may reject \`VNC_USER_PASSWORD\`."
   fi
   if [ -f "/Users/Shared/${DMG_NAME}" ]; then
     dmg_line="- \`${DMG_NAME}\` is on the Desktop and at \`/Users/Shared/${DMG_NAME}\`."
   else
     dmg_line="- Installer was not downloaded. From the desktop: \`curl -fL -o ~/Desktop/${DMG_NAME} ${DMG_URL}\`"
   fi
-  if [ -f "${ROOT}/display-bytes.txt" ]; then
+  if [ -f "${ROOT}/gui-check.txt" ]; then
+    display_line="- GUI check: $(cat "${ROOT}/gui-check.txt")"
+  elif [ -f "${ROOT}/display-bytes.txt" ]; then
     display_line="- Console capture: $(cat "${ROOT}/display-bytes.txt") bytes."
   else
     display_line=""
@@ -939,10 +1334,11 @@ print_banner() {
     log "  ${NGROK_NOTE}"
   fi
   if [ "$CONSOLE_PASSWORD_SET" = "yes" ]; then
-    log "  macOS account, if asked: ${CONSOLE_USER} or vncuser / VNC_USER_PASSWORD"
+    log "  macOS account, if asked: ${DESKTOP_USER:-$CONSOLE_USER} / VNC_USER_PASSWORD"
   else
-    log "  macOS account, if asked: vncuser / VNC_USER_PASSWORD"
+    log "  macOS account password was not changed. If asked, try ${DESKTOP_USER:-$CONSOLE_USER}; VNC_USER_PASSWORD may be rejected."
   fi
+  log "  The desktop should already be logged in (menu bar and Finder), not a black login window."
   log ""
   log "Browser shell (ttyd):"
   log "  ${SHELL_URL:-"(not ready)"}"
@@ -960,13 +1356,15 @@ print_banner() {
   fi
   log ""
   if [ -f "/Users/Shared/${DMG_NAME}" ]; then
-    log "Installer: /Users/Shared/${DMG_NAME} and the Desktop of ${CONSOLE_USER} and vncuser."
+    log "Installer: /Users/Shared/${DMG_NAME} and the Desktop of ${DESKTOP_USER:-$CONSOLE_USER}."
   else
     log "Installer was not downloaded."
     log "  curl -fL -o ~/Desktop/${DMG_NAME} ${DMG_URL}"
   fi
   log "Chrome: /Applications/Google Chrome.app"
-  if [ -f "${ROOT}/display-bytes.txt" ]; then
+  if [ -f "${ROOT}/gui-check.txt" ]; then
+    log "GUI check: $(cat "${ROOT}/gui-check.txt")"
+  elif [ -f "${ROOT}/display-bytes.txt" ]; then
     log "Console capture bytes: $(cat "${ROOT}/display-bytes.txt")"
   fi
   log "עברית: סיסמת ה-VNC היא הסוד VNC_PASSWORD. שולחן העבודה בדפדפן הוא הקישור למעלה. מבטלים את הריצה בסיום."
@@ -1014,10 +1412,7 @@ EOF
 
 refresh_tunnels() {
   local url
-  if ! port_open 6080; then
-    log "noVNC proxy is down. Starting it again."
-    start_novnc_proxy || true
-  fi
+  guard_novnc
   if ! port_open 7681; then
     start_ttyd || true
   fi
@@ -1063,11 +1458,14 @@ cmd_serve() {
   require_macos
   need_dir
   CONSOLE_USER=$(id -un)
+  load_session_state
   require_vnc_secrets
   if ! port_open 5900; then
     die "Screen Sharing is not listening. The setup step needs to succeed first."
   fi
   note_start
+  log "Checking the logged-in desktop before opening tunnels."
+  ensure_gui_ready vnc
   HOLD_MINUTES_EFFECTIVE=$(clamp_minutes "${HOLD_MINUTES:-90}")
 
   log "Installing noVNC, cloudflared, ngrok, ttyd, and tmate."
@@ -1150,6 +1548,8 @@ cmd_serve() {
   fi
   export HOLD_MINUTES_EFFECTIVE HOLD_END_TEXT
 
+  log "Checking the desktop once more before publishing the browser URL."
+  ensure_gui_ready vnc
   write_connect_file || log "Could not copy CONNECT.txt onto the Desktop."
   print_banner
 
@@ -1226,6 +1626,31 @@ EOF
   rm -f "$sample"
   VNC_PASSWORD=""
   NGROK_AUTH_TOKEN=""
+
+  if gui_verdict runner runner runner picture skip; then
+    :
+  else
+    die "gui_verdict rejected a logged-in desktop"
+  fi
+  if gui_verdict runner vncuser runner picture skip; then
+    die "gui_verdict accepted a console owned by a different user"
+  fi
+  if gui_verdict runner runner "-" picture skip; then
+    die "gui_verdict accepted a session with no Finder"
+  fi
+  if gui_verdict runner runner runner black skip; then
+    die "gui_verdict accepted a black screenshot"
+  fi
+  if gui_verdict runner runner runner picture black; then
+    die "gui_verdict accepted a black VNC framebuffer"
+  fi
+  if gui_verdict runner root loginwindow black skip; then
+    die "gui_verdict accepted the login window"
+  fi
+  if gui_verdict runner loginwindow runner picture skip; then
+    die "gui_verdict accepted loginwindow as the console user"
+  fi
+  python3 "$GUI_CHECK" self-test
 
   if port_open 59991; then
     die "port_open reported a closed port as open"

@@ -13,7 +13,7 @@ Repository → **Settings** → **Secrets and variables** → **Actions** → **
 | Secret | Required | Value |
 | --- | --- | --- |
 | `VNC_PASSWORD` | Yes | Legacy VNC password. **8 characters or fewer** (macOS keeps the first 8). Letters and digits. This is the password for TightVNC, RealVNC, and the browser desktop. |
-| `VNC_USER_PASSWORD` | Yes | macOS password for `vncuser` and the console user (`runner` on GitHub). Avoid a leading `-` and avoid `:`. Used when a client asks for a macOS account, and as the browser-shell basic-auth password. |
+| `VNC_USER_PASSWORD` | Yes | macOS password set on the console user (`runner` on GitHub). Avoid a leading `-` and avoid `:`. Used if a client asks for a macOS account, and as the browser-shell basic-auth password. |
 | `NGROK_AUTH_TOKEN` | For native VNC | Authtoken from [ngrok](https://dashboard.ngrok.com/get-started/your-authtoken). The free plan is enough. **TCP needs a card saved on the ngrok account; ngrok does not charge that card.** The browser desktop works before the card is saved. |
 
 GitHub masks these values in the log. They are not printed.
@@ -31,15 +31,17 @@ A second run cancels the one that is already open. Cancel the run when you finis
 
 Open the run and read the **Summary**. The same text is in the job log. The log is public, so the tunnel addresses are visible to anyone until you cancel.
 
-**Browser desktop (works from Windows Chrome):** open the `trycloudflare.com` link that ends in `vnc.html`. Password: `VNC_PASSWORD`.
+**Browser desktop (works from Windows Chrome):** open the `trycloudflare.com` link that ends in `vnc.html`. Password: `VNC_PASSWORD`. Within about a minute of connecting you should see a logged-in macOS desktop (menu bar and Finder), not a black or dark-grey screen. If the page asks for a macOS account, use `runner` and `VNC_USER_PASSWORD`.
 
-**Native VNC client (TightVNC or RealVNC Viewer):** host and port from the ngrok TCP line. TightVNC wants `host::port` (two colons). Password: `VNC_PASSWORD`. If the client asks for a macOS user, use `runner` or `vncuser` with `VNC_USER_PASSWORD`.
+**Native VNC client (TightVNC or RealVNC Viewer):** host and port from the ngrok TCP line. TightVNC wants `host::port` (two colons). Password: `VNC_PASSWORD`. If the client asks for a macOS user, use `runner` with `VNC_USER_PASSWORD`.
 
 **Browser shell:** second `trycloudflare.com` link (ttyd). Basic auth user `runner`, password `VNC_USER_PASSWORD`. Public tmate servers (`ssh.tmate.io`) have been offline since July 2025, so ttyd is the shell that comes up. The workflow still tries tmate and prints an SSH or web line when a server answers.
 
 ### 4. On the desktop
 
-Google Chrome is already installed at `/Applications/Google Chrome.app`. The DMG is on the Desktop, on `vncuser`'s Desktop, and at `/Users/Shared/SunoCoverBotSetup-mac.dmg`. `CONNECT.txt` in those same places repeats the addresses.
+The desktop is the `runner` account that already owns the Aqua session. Google Chrome is installed at `/Applications/Google Chrome.app`. The DMG is on that user's Desktop and at `/Users/Shared/SunoCoverBotSetup-mac.dmg`. `CONNECT.txt` in those same places repeats the addresses.
+
+The setup step does not publish the tunnel when the console is a login window. The job log line `GUI check:` names the console user, whether Finder is running for that user, and the screenshot brightness. A near-black framebuffer fails the job. In the Summary, that same line is how you confirm the desktop was real before you connect. After you open noVNC, the menu bar and Finder should be visible within about a minute.
 
 Install `SunoCoverBot` from the DMG, then install the Chrome extension in the runner's Chrome. If Gatekeeper blocks the app: **System Settings → Privacy & Security → Open Anyway**.
 
@@ -58,7 +60,7 @@ Install `SunoCoverBot` from the DMG, then install the Chrome extension in the ru
 Settings → Secrets and variables → Actions → New repository secret.
 
 - `VNC_PASSWORD` — חובה. סיסמת VNC, עד 8 תווים (אותיות וספרות). זו הסיסמה לדפדפן וללקוח VNC.
-- `VNC_USER_PASSWORD` — חובה. סיסמת macOS למשתמשים `vncuser` ו-`runner`. בלי `-` בהתחלה ובלי `:`.
+- `VNC_USER_PASSWORD` — חובה. סיסמת macOS למשתמש `runner` (משתמש הקונסולה). בלי `-` בהתחלה ובלי `:`.
 - `NGROK_AUTH_TOKEN` — ל-VNC רגיל (TCP). מפתח חינמי מ-[ngrok](https://dashboard.ngrok.com/get-started/your-authtoken). ל-TCP צריך כרטיס שמור בחשבון ngrok; ngrok לא מחייב את הכרטיס. שולחן העבודה בדפדפן עובד גם בלי הכרטיס.
 
 הערכים לא מופיעים בלוג (GitHub מסתיר סודות).
@@ -70,10 +72,12 @@ Settings → Secrets and variables → Actions → New repository secret.
 
 בסיכום הריצה (Summary):
 
-1. **דפדפן** — קישור `trycloudflare.com` עם `vnc.html`. סיסמה: `VNC_PASSWORD`.
-2. **לקוח VNC** (TightVNC / RealVNC) — כתובת ngrok. ב-TightVNC כותבים `host::port`. אם מתבקשים משתמש: `runner` או `vncuser`, סיסמה `VNC_USER_PASSWORD`.
+1. **דפדפן** — קישור `trycloudflare.com` עם `vnc.html`. סיסמה: `VNC_PASSWORD`. תוך כדקה אמור להופיע שולחן עבודה מחובר (תפריט ו-Finder), לא מסך שחור. אם מתבקשים חשבון macOS: `runner` והסוד `VNC_USER_PASSWORD`.
+2. **לקוח VNC** (TightVNC / RealVNC) — כתובת ngrok. ב-TightVNC כותבים `host::port`. אם מתבקשים משתמש: `runner`, סיסמה `VNC_USER_PASSWORD`.
 3. **מעטפת בדפדפן** — קישור ttyd. משתמש `runner`, סיסמה `VNC_USER_PASSWORD`. שרתי tmate הציבוריים כבויים מיולי 2025; ttyd הוא המעטפת שעולה.
 
-Chrome כבר מותקן. אם Gatekeeper חוסם: System Settings → Privacy & Security → Open Anyway.
+Chrome כבר מותקן, אצל המשתמש `runner`. אם Gatekeeper חוסם: System Settings → Privacy & Security → Open Anyway.
+
+שלב ה-setup נכשל במקום לפרסם מנהרה אם הקונסולה היא חלון התחברות שחור. בשורת `GUI check:` בלוג: משתמש הקונסולה, האם Finder רץ עבורו, ובהירות צילום המסך. אחרי פתיחת noVNC אמורים לראות את שולחן העבודה תוך כדקה.
 
 הלוג ציבורי. מבטלים את הריצה בסיום. ריצה חדשה סוגרת את הקודמת.
